@@ -403,7 +403,7 @@ def collect_device_info(client: paramiko.SSHClient, ip: str) -> paramiko.SSHClie
                 continue
             iface_norm = re.sub(r'^(?:gigabitethernet|gi|ge)', '', parts[0].lower())
             iface_up[iface_norm] = (parts[4].lower() == 'up')
-            if parts[0].lower() == 'dialer1' and len(parts) >= 2 and ip_pattern.match(parts[1]):
+            if parts[0].lower().startswith('dialer') and len(parts) >= 2 and ip_pattern.match(parts[1]):
                 circuit_status = f"CONNECTED ({parts[1]})"
                 wan_ip_cache[ip] = parts[1]
         info['circuit'] = circuit_status
@@ -796,6 +796,8 @@ def info_collector_loop(ips: list[str]) -> None:
     """
     INFO_INTERVAL = 60
     while True:
+        cycle_start = time.time()
+
         with state_lock:
             candidates = [
                 ip for ip in ips
@@ -812,7 +814,9 @@ def info_collector_loop(ips: list[str]) -> None:
         for t in threads:
             t.join()
 
-        time.sleep(INFO_INTERVAL)
+        remaining = INFO_INTERVAL - (time.time() - cycle_start)
+        if remaining > 0:
+            time.sleep(remaining)
 
 
 def print_status(ips: list[str], display_order: list[str], now: float) -> None:

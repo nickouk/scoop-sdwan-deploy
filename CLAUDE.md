@@ -2,9 +2,105 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Deployment Pipeline
+
+This repository is **Step 2** of a broader SD-WAN deployment pipeline for migrating sites to a Cisco IOS-XE SD-WAN solution.
+
+| Step | Script | Purpose |
+|------|--------|---------|
+| 1 | *(ping monitor — embedded in step 2)* | Confirm sites are reachable and stable |
+| 2 | `code-upgrade.py` | Upgrade IOS-XE software to the target SD-WAN version |
+| 3 | *(future)* | Assign devices to onboarding config group in vManage |
+| 4 | *(future)* | Move devices to final config group once code version confirmed |
+| 5 | *(future)* | Verification pass — confirm site is live |
+
+Each step runs against the same IP list (sourced from the multiping file) and should produce a clear pass/fail status per site before the next step begins.
+
+---
+
+## Device & Site Naming
+
+**Hostname format:** `SC-{SITE-TYPE}-{STORE-NUM}-{DEVICETYPE}{INDEX}`
+**Example:** `SC-3-0007-R1`
+
+| Field | Values | Meaning |
+|-------|--------|---------|
+| `SITE-TYPE` | `3` | Retail |
+| | `4` | Welcome Franchise |
+| | `5` | ELS Liet |
+| | `6` | ELS |
+| `STORE-NUM` | `0001`–`9999` | 4-digit zero-padded store number |
+| `DEVICETYPE` | `R` | CEDGE (branch router) |
+| `INDEX` | `1`, `2` | Device index at site (HA pairs) |
+
+The `SITE-TYPE` + `STORE-NUM` concatenated (e.g. `30007`) is the **vManage `site-id`** for that site.
+
+---
+
+## vManage
+
+**Base URL:** `https://vmanage-953677893.sdwan.cisco.com/`
+**Auth:** username/password — prompted at script startup alongside device credentials
+
+### Configuration Groups
+
+Each CEDGE is initially assigned to the **onboarding** config group for the code upgrade, then moved to its **final** config group once the target code version is confirmed.
+
+| UUID | Name | Used when |
+|------|------|-----------|
+| `8cd9fc8a-a552-41be-95f5-42fc4bcc6ad9` | `onboard_r1_pppoe_r2_pppoe` | All sites during code upgrade (step 2) |
+| `9ec9950c-bbcb-4d09-8466-c33d2eb8d902` | `onboard_r1_eth_r2_eth` | Onboarding (Ethernet WAN variant) |
+| `90edb92d-05e9-4887-886c-fea0ef535422` | `type34_r1_pppoe_r2_pppoe` | **Final** — SITE-TYPE 3 or 4 |
+| `70be7b37-7b9b-4b79-bfbc-80dba0f4c994` | `type56_r1_pppoe_r2_pppoe` | **Final** — SITE-TYPE 5 or 6 |
+| `8567e55b-26da-406b-9ede-694490f5c870` | `type34_r1_eth_r2_eth` | Final — type 3/4 Ethernet WAN variant |
+| `cfb79bce-ec89-4790-900b-d9493ef3c3db` | `type56_1127X` | Final — type 5/6 on 1127X hardware |
+| `77da43d2-1f81-4ab2-8aac-ce76512136fb` | `onboard_1127X` | Onboarding — 1127X hardware |
+| `5607f32e-7391-4241-95a6-c2ac5b4d17fd` | `poc_nicko` | PoC / testing |
+| `f5ea86ef-8f5c-4319-a518-6c169b9d7025` | `icon_hubs` | Hub sites |
+
+**Config group selection logic (final):**
+```
+SITE-TYPE in {3, 4}  →  type34_r1_pppoe_r2_pppoe
+SITE-TYPE in {5, 6}  →  type56_r1_pppoe_r2_pppoe
+```
+
+### Per-site Variables
+
+These must be substituted for each device when attaching a config group:
+
+| Variable | Source |
+|----------|--------|
+| `system-ip` | `172.x.x.x` — assigned manually, read from `pingips.txt` |
+| `site-id` | Integer value of `SITE-TYPE + STORE-NUM` (e.g. `30007`) |
+| `hostname` | Derived from naming format above |
+| `loopback0` | Same as `system-ip` |
+| `timezone` | Derived from region (UK → `Europe/London`, EU → `Europe/Berlin`, etc.) |
+
+### Hub Sites
+
+BFD sessions to both hubs must be up as part of the verification pass criteria.
+
+| Hostname | System IP |
+|----------|-----------|
+| `SC-1-0001-LD8-R1` | `172.31.116.0` |
+| `SC-1-0001-THN-R1` | `172.31.116.1` |
+
+---
+
+## Verification Pass Criteria
+
+A site is considered **live** only when **all** of the following are true:
+
+- vManage sync status = `In Sync`
+- BFD sessions up to both hub sites (`172.31.116.0` and `172.31.116.1`)
+- OMP peers = 2
+- Ping to `8.8.8.8` from device succeeds
+
+---
+
 ## Overview
 
-A single-file Python script that monitors Cisco IOS-XE SD-WAN routers via ping and automatically upgrades their software to `17.15.04c.0.107` when they become reachable. Designed for batch upgrades across many store/funeral-home sites.
+A single-file Python script that monitors Cisco IOS-XE SD-WAN routers via ping and automatically upgrades their software to `17.15.04c.0.107` when they become reachable. The ping monitor (Step 1) is embedded in this script — devices must sustain 30 seconds of continuous uptime before the upgrade (Step 2) is triggered.
 
 ## Running
 
