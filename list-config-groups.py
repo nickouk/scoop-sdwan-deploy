@@ -4,7 +4,7 @@ import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-VMANAGE_URL = "https://vmanage-953677893.sdwan.cisco.com"
+VMANAGE_URL = "https://vmanage-953677893.sdwan.cisco.com:8443"
 
 
 def get_session(username, password):

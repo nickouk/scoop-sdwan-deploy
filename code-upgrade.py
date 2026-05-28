@@ -15,6 +15,10 @@ import sys
 from datetime import datetime
 
 import paramiko
+import requests
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 PING_FILE       = "/mnt/c/Users/nick.oneill/Tools/multiping/pingips.txt"
@@ -33,12 +37,25 @@ REBOOT_POLL     = 10          # seconds between reboot connectivity checks
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STATUS_FILE = os.path.join(_SCRIPT_DIR, "upgrade_status.json")
 
+VMANAGE_BASE_URL     = "https://vmanage-953677893.sdwan.cisco.com:8443"
+VMANAGE_ONBOARD_UUID = "8cd9fc8a-a552-41be-95f5-42fc4bcc6ad9"
+VMANAGE_FINAL_GROUPS = {
+    "3": "90edb92d-05e9-4887-886c-fea0ef535422",
+    "4": "90edb92d-05e9-4887-886c-fea0ef535422",
+    "5": "70be7b37-7b9b-4b79-bfbc-80dba0f4c994",
+    "6": "70be7b37-7b9b-4b79-bfbc-80dba0f4c994",
+}
+VMANAGE_TIMEZONE = "Europe/London"
+
 
 # ── Credentials (populated at startup) ────────────────────────────────────────
-local_user = ""
-local_pass = ""
-ise_user   = ""
-ise_pass   = ""
+local_user      = ""
+local_pass      = ""
+ise_user        = ""
+ise_pass        = ""
+vmanage_user    = ""
+vmanage_pass    = ""
+vmanage_session: requests.Session | None = None
 
 
 # ── Shared state ──────────────────────────────────────────────────────────────
@@ -59,6 +76,9 @@ circuit_ping_offline: set[str]        = set() # completed IPs offline per ping t
 bin_missing:          set[str]        = set() # IPs that failed because install .bin not found
 file_copying:         set[str]        = set() # IPs where .bin exists but copy is still in progress
 wan_ip_cache:         dict[str, str]  = {}   # ip -> last known WAN/Dialer1 IP
+vmanage_status:       dict[str, str]  = {}   # ip -> config group move status
+vmanage_tasks:        list[dict]      = []   # active tasks polled from vManage API
+vmanage_tasks_lock    = threading.Lock()
 state_lock    = threading.Lock()
 print_lock    = threading.Lock()
 _info_sem     = threading.Semaphore(10)  # max concurrent info-collection SSH sessions
@@ -98,6 +118,8 @@ def save_status() -> None:
                 devices[ip]["hostname"] = hostnames[ip]
             if ip in device_info:
                 devices[ip]["device_info"] = device_info[ip]
+            if ip in vmanage_status:
+                devices[ip]["vmanage_status"] = vmanage_status[ip]
 
     data = {"last_updated": now_str, "devices": devices}
     tmp = STATUS_FILE + ".tmp"
@@ -146,6 +168,9 @@ def load_status(ips: list[str]) -> None:
             saved_info = entry.get("device_info")
             if saved_info:
                 device_info[ip] = saved_info
+            vm_st = entry.get("vmanage_status")
+            if vm_st:
+                vmanage_status[ip] = vm_st
             msgs.append(f"  {ip:<20}  {hostname:<28}  {label} (skipping)")
 
         elif status == "retry":
@@ -228,13 +253,16 @@ def log(ip: str, msg: str, console: bool = False) -> None:
 
 
 def prompt_credentials() -> None:
-    global local_user, local_pass, ise_user, ise_pass
+    global local_user, local_pass, ise_user, ise_pass, vmanage_user, vmanage_pass
     print("=== SD-WAN Code Upgrade Tool ===\n")
     local_user = input("Local username: ").strip()
     local_pass = getpass.getpass("Local password: ")
     print()
     ise_user   = input("ISE username: ").strip()
     ise_pass   = getpass.getpass("ISE password: ")
+    print()
+    vmanage_user = input("vManage username: ").strip()
+    vmanage_pass = getpass.getpass("vManage password: ")
     print()
 
 
@@ -447,6 +475,182 @@ def run_command(client: paramiko.SSHClient, ip: str, command: str,
     if err.strip():
         log(ip, f"STDERR: {err.strip()}")
     return client, output
+
+
+# ── vManage helpers ───────────────────────────────────────────────────────────
+
+def vmanage_login() -> bool:
+    """Authenticate with vManage. Stores the authenticated session globally."""
+    global vmanage_session
+    session = requests.Session()
+    session.verify = False
+
+    # ── Step 1: Basic connectivity check ──────────────────────────────────────
+    print(f"  Connecting to vManage at {VMANAGE_BASE_URL} …")
+    try:
+        probe = session.get(VMANAGE_BASE_URL, timeout=15, allow_redirects=True)
+        print(f"  vManage reachable — HTTP {probe.status_code} ({probe.url})")
+    except Exception as exc:
+        print(f"  vManage unreachable: {exc}")
+        return False
+
+    # ── Step 2: POST credentials (don't follow redirects — check for JSESSIONID) ──
+    print(f"  Logging in as '{vmanage_user}' …")
+    try:
+        resp = session.post(
+            f"{VMANAGE_BASE_URL}/j_security_check",
+            data={"j_username": vmanage_user, "j_password": vmanage_pass},
+            timeout=30,
+            allow_redirects=False,
+        )
+        print(f"  Login POST → HTTP {resp.status_code}")
+        if resp.status_code not in (200, 302) or "JSESSIONID" not in session.cookies:
+            print(f"  Login failed — no session cookie returned")
+            return False
+    except Exception as exc:
+        print(f"  Login POST error: {exc}")
+        return False
+
+    # ── Step 3: Fetch XSRF token ───────────────────────────────────────────────
+    try:
+        resp2 = session.get(f"{VMANAGE_BASE_URL}/dataservice/client/token", timeout=15)
+        print(f"  XSRF token fetch → HTTP {resp2.status_code}")
+        if resp2.status_code == 200 and resp2.text.strip():
+            session.headers.update({"X-XSRF-TOKEN": resp2.text.strip()})
+    except Exception as exc:
+        print(f"  XSRF token fetch error (non-fatal): {exc}")
+
+    vmanage_session = session
+    print("  vManage login successful\n")
+    log("vManage", "Login successful", console=True)
+    return True
+
+
+def _vmanage_get_device_uuid(ip: str) -> str | None:
+    """Return the vManage device UUID for the given system-ip."""
+    if not vmanage_session:
+        return None
+    try:
+        resp = vmanage_session.get(
+            f"{VMANAGE_BASE_URL}/dataservice/system/device/vedges",
+            timeout=30,
+        )
+        resp.raise_for_status()
+        for dev in resp.json().get("data", []):
+            if dev.get("system-ip") == ip:
+                return dev.get("uuid")
+    except Exception as exc:
+        log(ip, f"vManage get-device-uuid error: {exc}")
+    return None
+
+
+def move_to_final_config_group(ip: str) -> None:
+    """Move device from onboarding to final config group. Runs in its own thread."""
+    with state_lock:
+        upgrade_done   = completed.get(ip) == "UPGRADE COMPLETE"
+        config_status  = device_info.get(ip, {}).get('config', '?')
+        hostname       = hostnames.get(ip, "")
+
+    if not upgrade_done:
+        log(ip, "vManage: skipping config group move — upgrade not complete", console=True)
+        return
+
+    if config_status != 'REQUIRED':
+        log(ip, f"vManage: skipping config group move — CONFIG is '{config_status}', not on onboarding group", console=True)
+        return
+
+    if not vmanage_session:
+        log(ip, "vManage: no session — skipping config group move", console=True)
+        with state_lock:
+            vmanage_status[ip] = "SKIPPED"
+        save_status()
+        return
+
+    with state_lock:
+        vmanage_status[ip] = "MOVING"
+
+    try:
+        if not hostname:
+            raise ValueError("hostname not known — cannot derive site-id")
+
+        m = re.match(r'^SC-(\d+)-(\d{4})-', hostname)
+        if not m:
+            raise ValueError(f"cannot parse hostname: {hostname}")
+        site_type = m.group(1)
+        store_num = m.group(2)
+        site_id   = int(site_type + store_num)
+
+        target_group = VMANAGE_FINAL_GROUPS.get(site_type)
+        if not target_group:
+            raise ValueError(f"no final config group for site-type {site_type}")
+
+        log(ip, f"vManage: moving to final config group (site-type={site_type} site-id={site_id})", console=True)
+
+        uuid = _vmanage_get_device_uuid(ip)
+        if not uuid:
+            raise ValueError(f"device UUID not found for system-ip {ip}")
+        log(ip, f"vManage: device UUID = {uuid}")
+
+        payload = {
+            "id": target_group,
+            "devices": [{
+                "id": uuid,
+                "variables": {
+                    "system-ip":  ip,
+                    "site-id":    site_id,
+                    "hostname":   hostname,
+                    "loopback0":  ip,
+                    "timezone":   VMANAGE_TIMEZONE,
+                },
+            }],
+        }
+        resp = vmanage_session.post(
+            f"{VMANAGE_BASE_URL}/dataservice/v1/config-group/{target_group}/device/associate",
+            json=payload,
+            timeout=60,
+        )
+        resp.raise_for_status()
+        log(ip, f"vManage: config group move successful (HTTP {resp.status_code})", console=True)
+        with state_lock:
+            vmanage_status[ip] = "MOVED"
+
+    except Exception as exc:
+        log(ip, f"vManage: config group move FAILED: {exc}", console=True)
+        with state_lock:
+            vmanage_status[ip] = "FAILED"
+
+    save_status()
+
+
+vmanage_poll_status: dict = {"last_poll": None, "error": None, "raw_count": 0}
+
+def _poll_vmanage_tasks() -> None:
+    """Fetch active tasks from vManage and update the global vmanage_tasks list."""
+    if not vmanage_session:
+        vmanage_poll_status["error"] = "no session"
+        return
+    try:
+        resp = vmanage_session.get(
+            f"{VMANAGE_BASE_URL}/dataservice/device/action/status/tasks",
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        all_tasks = data.get("runningTasks", [])
+        log("vManage", f"Task poll: {len(all_tasks)} running task(s)")
+        with vmanage_tasks_lock:
+            vmanage_tasks[:] = all_tasks
+        vmanage_poll_status.update({"last_poll": ts(), "error": None, "raw_count": len(all_tasks)})
+    except Exception as exc:
+        vmanage_poll_status.update({"last_poll": ts(), "error": str(exc)})
+        log("vManage", f"Task poll error: {exc}")
+
+
+def vmanage_task_monitor_loop() -> None:
+    """Background thread: poll vManage tasks every 30 seconds."""
+    while True:
+        _poll_vmanage_tasks()
+        time.sleep(30)
 
 
 def wait_for_reboot(ip: str) -> bool:
@@ -701,6 +905,9 @@ def upgrade_device(ip: str) -> None:
             in_progress_step.pop(ip, None)
         save_status()
 
+        # ── Step 9: Move to final config group on vManage ─────────────────────
+        threading.Thread(target=move_to_final_config_group, args=(ip,), daemon=True).start()
+
     except Exception as exc:
         try:
             client.close()
@@ -767,7 +974,7 @@ def ping_loop(ips: list[str], display_order: list[str]) -> None:
                         up_since.pop(ip, None)
 
         # Print status summary
-        print_status(ips, display_order, now)
+        print_status(display_order, now)
         time.sleep(PING_INTERVAL)
 
 
@@ -819,11 +1026,14 @@ def info_collector_loop(ips: list[str]) -> None:
             time.sleep(remaining)
 
 
-def print_status(ips: list[str], display_order: list[str], now: float) -> None:
+_DASH_WIDTH = 170
+
+def print_status(display_order: list[str], now: float) -> None:
     with print_lock:
-        print(f"\n{'─'*170}")
+        print("\033[2J\033[H", end="")  # clear screen, cursor to top
+        print(f"{'─'*_DASH_WIDTH}")
         print(f"  {'IP':<20}  {'HOSTNAME':<14}  {'CODE STATUS':<34}  {'CONFIG':<10}  {'POLICY':<10}  {'CIRCUIT':<28}  {'SWITCHPORTS':<40}")
-        print(f"{'─'*170}")
+        print(f"{'─'*_DASH_WIDTH}")
         for entry in display_order:
             if entry.startswith("#"):
                 print(f"  {entry}")
@@ -855,7 +1065,14 @@ def print_status(ips: list[str], display_order: list[str], now: float) -> None:
                     else:
                         state = status
                 info = device_info.get(ip, {})
-                cfg     = info.get('config',  '')
+                cfg_device = info.get('config', '')
+                vm_st      = vmanage_status.get(ip, '')
+                if cfg_device == 'COMPLETE':
+                    cfg = 'COMPLETE'
+                elif vm_st:
+                    cfg = vm_st
+                else:
+                    cfg = cfg_device
                 policy  = info.get('policy',  '')
                 if ip in circuit_ping_offline:
                     wan_ip  = wan_ip_cache.get(ip, '')
@@ -864,7 +1081,34 @@ def print_status(ips: list[str], display_order: list[str], now: float) -> None:
                     circuit = info.get('circuit', '')
                 switchports = info.get('switchports', '')
             print(f"  {ip:<20}  {hostnames.get(ip, ''):<14}  {state:<34}  {cfg:<10}  {policy:<10}  {circuit:<28}  {switchports:<40}")
-        print(f"{'─'*170}  [{ts()}]\n")
+        print(f"{'─'*_DASH_WIDTH}  [{ts()}]")
+
+        # vManage task summary (live from vManage API)
+        print()
+        if not vmanage_session:
+            print("  vManage  not connected")
+        else:
+            poll_err  = vmanage_poll_status.get("error")
+            last_poll = vmanage_poll_status.get("last_poll")
+            if poll_err:
+                print(f"  vManage  poll error: {poll_err}" + (f"  (last ok: {last_poll})" if last_poll else ""))
+            elif not last_poll:
+                print("  vManage  connected — waiting for first poll…")
+            else:
+                with vmanage_tasks_lock:
+                    tasks_snapshot = list(vmanage_tasks)
+                if not tasks_snapshot:
+                    print(f"  vManage  no active tasks  (polled {last_poll})")
+                else:
+                    for task in tasks_snapshot:
+                        name   = task.get("name", "unknown task")
+                        status = task.get("status", "")
+                        user   = task.get("userSessionUserName", "")
+                        parts  = [f"  vManage  {name}  [{status}]"]
+                        if user:
+                            parts.append(f"user={user}")
+                        print("  ".join(parts))
+        print()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -879,7 +1123,7 @@ def main() -> None:
  | |_) || |_| || |_) || |\  || |___   | |
  |____/  \___/ |____/ |_| \_||_____|  |_|
 
-          SD-WAN Code Upgrade  --  Coming Online
+          SD-WAN Deployment pipeline  --  Coming Online
 """)
 
     log_path = os.path.join(_SCRIPT_DIR, f"code_upgrade_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
@@ -888,6 +1132,9 @@ def main() -> None:
     print(f"Status file: {STATUS_FILE}\n")
 
     prompt_credentials()
+
+    if not vmanage_login():
+        print("WARNING: vManage login failed — config group moves will be skipped\n")
 
     ips, display_order = extract_172_ips(PING_FILE)
     if not ips:
@@ -899,12 +1146,27 @@ def main() -> None:
         ping_results[ip] = "Down"
     load_status(ips)
 
+    # Resume any config group moves that didn't complete in a previous run
+    with state_lock:
+        pending_moves = [
+            ip for ip in ips
+            if completed.get(ip) == "UPGRADE COMPLETE"
+            and vmanage_status.get(ip) not in ("MOVED", "SKIPPED")
+        ]
+    for ip in pending_moves:
+        log(ip, "Resuming vManage config group move from previous run", console=True)
+        threading.Thread(target=move_to_final_config_group, args=(ip,), daemon=True).start()
+
     print(f"Found {len(ips)} target IP(s):\n  " + "\n  ".join(ips))
     print(f"\nMonitoring — upgrade triggers after {UP_THRESHOLD}s continuous uptime\n")
 
     # Start background info collector
     t_info = threading.Thread(target=info_collector_loop, args=(ips,), daemon=True)
     t_info.start()
+
+    if vmanage_session:
+        t_vm = threading.Thread(target=vmanage_task_monitor_loop, daemon=True)
+        t_vm.start()
 
     try:
         ping_loop(ips, display_order)

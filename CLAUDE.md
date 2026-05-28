@@ -10,9 +10,8 @@ This repository is **Step 2** of a broader SD-WAN deployment pipeline for migrat
 |------|--------|---------|
 | 1 | *(ping monitor — embedded in step 2)* | Confirm sites are reachable and stable |
 | 2 | `code-upgrade.py` | Upgrade IOS-XE software to the target SD-WAN version |
-| 3 | *(future)* | Assign devices to onboarding config group in vManage |
-| 4 | *(future)* | Move devices to final config group once code version confirmed |
-| 5 | *(future)* | Verification pass — confirm site is live |
+| 3 | *(future)* | Move devices to final config group once code version confirmed |
+| 4 | *(future)* | Verification pass — confirm site is live |
 
 Each step runs against the same IP list (sourced from the multiping file) and should produce a clear pass/fail status per site before the next step begins.
 
@@ -27,7 +26,7 @@ Each step runs against the same IP list (sourced from the multiping file) and sh
 |-------|--------|---------|
 | `SITE-TYPE` | `3` | Retail |
 | | `4` | Welcome Franchise |
-| | `5` | ELS Liet |
+| | `5` | ELS Lite |
 | | `6` | ELS |
 | `STORE-NUM` | `0001`–`9999` | 4-digit zero-padded store number |
 | `DEVICETYPE` | `R` | CEDGE (branch router) |
@@ -39,7 +38,8 @@ The `SITE-TYPE` + `STORE-NUM` concatenated (e.g. `30007`) is the **vManage `site
 
 ## vManage
 
-**Base URL:** `https://vmanage-953677893.sdwan.cisco.com/`
+**Base URL:** `https://vmanage-953677893.sdwan.cisco.com:8443/`
+**Controller version:** `20.15.4.4`
 **Auth:** username/password — prompted at script startup alongside device credentials
 
 ### Configuration Groups
