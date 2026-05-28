@@ -6,6 +6,7 @@ Monitors routers via ping and upgrades to 17.15.04c.0.107 when reachable.
 
 import re
 import os
+import csv
 import json
 import time
 import threading
@@ -45,7 +46,18 @@ VMANAGE_FINAL_GROUPS = {
     "5": "70be7b37-7b9b-4b79-bfbc-80dba0f4c994",
     "6": "70be7b37-7b9b-4b79-bfbc-80dba0f4c994",
 }
-VMANAGE_TIMEZONE = "Europe/London"
+CSV_VARS_FILE = (
+    "/mnt/c/Users/nick.oneill/OneDrive - Maintel Europe Limited/"
+    "Southern Coops - Rollout docs/vmanage-import-sc.csv"
+)
+# Human-readable CSV column headers that map to different vManage variable names
+VMANAGE_COL_MAP = {
+    "System IP":               "system_ip",
+    "Host Name":               "host_name",
+    "Site Id":                 "site_id",
+    "Dual Stack IPv6 Default": "ipv6_strict_control",
+    "Rollback Timer (sec)":    "pseudo_commit_timer",
+}
 
 
 # ── Credentials (populated at startup) ────────────────────────────────────────
@@ -77,6 +89,7 @@ bin_missing:          set[str]        = set() # IPs that failed because install 
 file_copying:         set[str]        = set() # IPs where .bin exists but copy is still in progress
 wan_ip_cache:         dict[str, str]  = {}   # ip -> last known WAN/Dialer1 IP
 vmanage_status:       dict[str, str]  = {}   # ip -> config group move status
+csv_vars:             dict[str, dict]  = {}   # system-ip -> full variable row from CSV
 vmanage_tasks:        list[dict]      = []   # active tasks polled from vManage API
 vmanage_tasks_lock    = threading.Lock()
 state_lock    = threading.Lock()
@@ -191,6 +204,22 @@ def load_status(ips: list[str]) -> None:
             print(m)
         print()
 
+
+def load_csv_vars() -> None:
+    """Load per-device variables from the vManage import CSV, keyed by System IP."""
+    if not os.path.exists(CSV_VARS_FILE):
+        print(f"WARNING: vManage CSV not found: {CSV_VARS_FILE}")
+        return
+    try:
+        with open(CSV_VARS_FILE, newline='', encoding='utf-8-sig') as fh:
+            for row in csv.DictReader(fh):
+                system_ip = row.get("System IP", "").strip()
+                if system_ip:
+                    # Exclude Device ID — it's a chassis identifier, not a template variable
+                    csv_vars[system_ip] = {k: v for k, v in row.items() if k != "Device ID"}
+        print(f"Loaded variables for {len(csv_vars)} device(s) from CSV")
+    except Exception as exc:
+        print(f"WARNING: Could not read vManage CSV: {exc}")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -544,6 +573,128 @@ def _vmanage_get_device_uuid(ip: str) -> str | None:
     return None
 
 
+def _wait_for_vmanage_idle(ip: str, timeout: int = 600, poll: int = 15) -> bool:
+    """
+    Block until vManage has no running tasks, then return True.
+    Returns False if tasks don't clear within timeout seconds.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            resp = vmanage_session.get(
+                f"{VMANAGE_BASE_URL}/dataservice/device/action/status/tasks",
+                timeout=15,
+            )
+            resp.raise_for_status()
+            running = resp.json().get("runningTasks", [])
+            # Update global task list so the dashboard stays current
+            with vmanage_tasks_lock:
+                vmanage_tasks[:] = running
+            if not running:
+                return True
+            names = ", ".join(t.get("name", "task") for t in running)
+            log(ip, f"vManage: waiting for {len(running)} running task(s): {names}", console=True)
+            with state_lock:
+                vmanage_status[ip] = f"WAITING ({len(running)} task(s))"
+        except Exception as exc:
+            log(ip, f"vManage: task-check error while waiting: {exc}")
+        time.sleep(poll)
+    return False
+
+
+def _vmanage_rollback_to_onboard(ip: str, uuid: str | None) -> None:
+    """Re-associate device with onboarding group if a mid-flight failure left it orphaned."""
+    if not uuid or not vmanage_session:
+        return
+    try:
+        resp = vmanage_session.post(
+            f"{VMANAGE_BASE_URL}/dataservice/v1/config-group/{VMANAGE_ONBOARD_UUID}/device/associate",
+            json={"devices": [{"id": uuid}]},
+            timeout=60,
+        )
+        if resp.ok:
+            log(ip, "vManage: rolled back to onboarding config group", console=True)
+        else:
+            log(ip, f"vManage: rollback failed HTTP {resp.status_code} — {resp.text[:200]!r}", console=True)
+    except Exception as exc:
+        log(ip, f"vManage: rollback error: {exc}", console=True)
+
+
+def _vmanage_build_variable_list(ip: str, target_group: str, uuid: str, csv_row: dict) -> list[dict]:
+    """
+    Build [{name, value}] for PUT /v1/config-group/{id}/device/variables.
+
+    GETs the full variable list from an existing device in the group to learn
+    variable names and their correct Python types.  Falls back to smart
+    inference if no template device is available.
+    """
+    reverse_col_map = {vm: csv_col for csv_col, vm in VMANAGE_COL_MAP.items()}
+
+    type_map: dict[str, type] = {}
+    all_var_names: list[str] = []
+
+    try:
+        resp = vmanage_session.get(
+            f"{VMANAGE_BASE_URL}/dataservice/v1/config-group/{target_group}/device/variables",
+            timeout=15,
+        )
+        if resp.ok:
+            devices = resp.json().get("devices", [])
+            # Prefer a device that isn't ours so we get real typed values
+            template_dev = next(
+                (d for d in devices if d.get("device-id") != uuid and d.get("variables")),
+                next((d for d in devices if d.get("variables")), None),
+            )
+            if template_dev:
+                for v in template_dev["variables"]:
+                    name = v["name"]
+                    all_var_names.append(name)
+                    val = v.get("value")
+                    if val is not None:
+                        type_map[name] = type(val)
+    except Exception as exc:
+        log(ip, f"vManage: variable list fetch failed (using inference): {exc}")
+
+    if not all_var_names:
+        # No template — use snake_case CSV keys plus the 5 mapped metadata columns
+        all_var_names = list(reverse_col_map.keys()) + [
+            k for k in csv_row if k not in VMANAGE_COL_MAP and re.match(r"^[a-zA-Z0-9_]+$", k)
+        ]
+
+    var_list: list[dict] = []
+    for vname in all_var_names:
+        csv_col = reverse_col_map.get(vname, vname)
+        raw = csv_row.get(csv_col, "").strip()
+        if not raw:
+            continue
+
+        vtype = type_map.get(vname)
+        try:
+            if vtype is list or vname.endswith("_dhcp_exclude"):
+                try:
+                    parsed = json.loads(raw)
+                    converted: object = parsed if isinstance(parsed, list) else [str(parsed)]
+                except (json.JSONDecodeError, ValueError):
+                    if '";"' in raw:
+                        converted = [s.strip() for s in raw.split('";"') if s.strip()]
+                    else:
+                        converted = [raw]
+            elif vtype is bool:
+                converted = raw.lower() not in ("false", "0", "no", "")
+            elif vtype is int:
+                converted = int(float(raw))
+            elif vtype is float:
+                converted = float(raw)
+            else:
+                converted = raw
+        except (ValueError, TypeError):
+            converted = raw
+
+        var_list.append({"name": vname, "value": converted})
+
+    return var_list
+
+
 def move_to_final_config_group(ip: str) -> None:
     """Move device from onboarding to final config group. Runs in its own thread."""
     with state_lock:
@@ -555,9 +706,25 @@ def move_to_final_config_group(ip: str) -> None:
         log(ip, "vManage: skipping config group move — upgrade not complete", console=True)
         return
 
-    if config_status != 'REQUIRED':
-        log(ip, f"vManage: skipping config group move — CONFIG is '{config_status}', not on onboarding group", console=True)
+    if config_status == 'COMPLETE':
+        log(ip, "vManage: skipping config group move — device already on final config group", console=True)
         return
+
+    if config_status == '?':
+        # Info not yet collected post-reboot — wait up to 3 minutes for the info collector to populate it
+        log(ip, "vManage: CONFIG not yet polled — waiting for info collector…", console=True)
+        deadline = time.time() + 180
+        while time.time() < deadline:
+            time.sleep(10)
+            with state_lock:
+                config_status = device_info.get(ip, {}).get('config', '?')
+            if config_status != '?':
+                break
+        if config_status == '?':
+            log(ip, "vManage: CONFIG still unknown after 3 minutes — proceeding anyway (device is on onboarding group post-upgrade)", console=True)
+        elif config_status == 'COMPLETE':
+            log(ip, "vManage: CONFIG is now COMPLETE — device already on final group, skipping move", console=True)
+            return
 
     if not vmanage_session:
         log(ip, "vManage: no session — skipping config group move", console=True)
@@ -567,8 +734,20 @@ def move_to_final_config_group(ip: str) -> None:
         return
 
     with state_lock:
-        vmanage_status[ip] = "MOVING"
+        vmanage_status[ip] = "WAITING"
 
+    if not _wait_for_vmanage_idle(ip):
+        log(ip, "vManage: timed out waiting for running tasks to clear — skipping move", console=True)
+        with state_lock:
+            vmanage_status[ip] = "FAILED"
+        save_status()
+        return
+
+    with state_lock:
+        vmanage_status[ip] = "ASSOCIATING"
+
+    uuid: str | None = None
+    disassociated = False
     try:
         if not hostname:
             raise ValueError("hostname not known — cannot derive site-id")
@@ -577,47 +756,103 @@ def move_to_final_config_group(ip: str) -> None:
         if not m:
             raise ValueError(f"cannot parse hostname: {hostname}")
         site_type = m.group(1)
-        store_num = m.group(2)
-        site_id   = int(site_type + store_num)
 
         target_group = VMANAGE_FINAL_GROUPS.get(site_type)
         if not target_group:
             raise ValueError(f"no final config group for site-type {site_type}")
 
-        log(ip, f"vManage: moving to final config group (site-type={site_type} site-id={site_id})", console=True)
+        csv_row = csv_vars.get(ip)
+        if not csv_row:
+            raise ValueError(f"no CSV variables found for system-ip {ip}")
+        log(ip, f"vManage: loaded {len(csv_row)} CSV columns")
 
         uuid = _vmanage_get_device_uuid(ip)
         if not uuid:
             raise ValueError(f"device UUID not found for system-ip {ip}")
         log(ip, f"vManage: device UUID = {uuid}")
 
-        payload = {
-            "id": target_group,
-            "devices": [{
-                "id": uuid,
-                "variables": {
-                    "system-ip":  ip,
-                    "site-id":    site_id,
-                    "hostname":   hostname,
-                    "loopback0":  ip,
-                    "timezone":   VMANAGE_TIMEZONE,
-                },
-            }],
-        }
-        resp = vmanage_session.post(
-            f"{VMANAGE_BASE_URL}/dataservice/v1/config-group/{target_group}/device/associate",
-            json=payload,
+        # ── Step 1: Disassociate from onboarding config group ─────────────────
+        log(ip, "vManage: disassociating from onboarding config group", console=True)
+        resp = vmanage_session.delete(
+            f"{VMANAGE_BASE_URL}/dataservice/v1/config-group/{VMANAGE_ONBOARD_UUID}/device/associate",
+            json={"devices": [{"id": uuid}]},
             timeout=60,
         )
+        if not resp.ok:
+            log(ip, f"vManage: disassociate HTTP {resp.status_code} — body: {resp.text[:500]!r}", console=True)
         resp.raise_for_status()
-        log(ip, f"vManage: config group move successful (HTTP {resp.status_code})", console=True)
-        with state_lock:
-            vmanage_status[ip] = "MOVED"
+        log(ip, f"vManage: disassociate successful (HTTP {resp.status_code})", console=True)
+        disassociated = True
 
-    except Exception as exc:
-        log(ip, f"vManage: config group move FAILED: {exc}", console=True)
+        # ── Step 2: Wait after disassociate ───────────────────────────────────
+        with state_lock:
+            vmanage_status[ip] = "WAITING"
+        if not _wait_for_vmanage_idle(ip):
+            raise ValueError("timed out waiting after disassociate")
+
+        # ── Step 3: Associate with final group (no variables at this stage) ────
+        log(ip, f"vManage: associating with final config group (site-type={site_type})", console=True)
+        resp = vmanage_session.post(
+            f"{VMANAGE_BASE_URL}/dataservice/v1/config-group/{target_group}/device/associate",
+            json={"devices": [{"id": uuid}]},
+            timeout=60,
+        )
+        if not resp.ok:
+            log(ip, f"vManage: associate HTTP {resp.status_code} — body: {resp.text[:500]!r}", console=True)
+        resp.raise_for_status()
+        log(ip, f"vManage: associate successful (HTTP {resp.status_code})", console=True)
+
+        # ── Step 4: Wait after associate ──────────────────────────────────────
+        with state_lock:
+            vmanage_status[ip] = "WAITING"
+        if not _wait_for_vmanage_idle(ip):
+            raise ValueError("timed out waiting after associate")
+
+        # ── Step 5: Set per-device variables ──────────────────────────────────
+        with state_lock:
+            vmanage_status[ip] = "SETTING VARS"
+        log(ip, "vManage: setting device variables", console=True)
+        var_list = _vmanage_build_variable_list(ip, target_group, uuid, csv_row)
+        log(ip, f"vManage: built {len(var_list)} variable entries from CSV")
+        resp = vmanage_session.put(
+            f"{VMANAGE_BASE_URL}/dataservice/v1/config-group/{target_group}/device/variables",
+            json={"solution": "sdwan", "devices": [{"device-id": uuid, "variables": var_list}]},
+            timeout=60,
+        )
+        if not resp.ok:
+            log(ip, f"vManage: set variables HTTP {resp.status_code} — body: {resp.text[:500]!r}", console=True)
+        resp.raise_for_status()
+        log(ip, f"vManage: variables set successfully (HTTP {resp.status_code})", console=True)
+
+        # ── Step 6: Deploy ─────────────────────────────────────────────────────
+        with state_lock:
+            vmanage_status[ip] = "DEPLOYING"
+        log(ip, "vManage: deploying config group to device", console=True)
+        resp = vmanage_session.post(
+            f"{VMANAGE_BASE_URL}/dataservice/v1/config-group/{target_group}/device/deploy",
+            json={"devices": [{"id": uuid}]},
+            timeout=60,
+        )
+        if not resp.ok:
+            log(ip, f"vManage: deploy HTTP {resp.status_code} — body: {resp.text[:500]!r}", console=True)
+        resp.raise_for_status()
+        log(ip, f"vManage: deploy submitted (HTTP {resp.status_code})", console=True)
+        with state_lock:
+            vmanage_status[ip] = "DEPLOYED"
+
+    except requests.HTTPError as exc:
+        body = exc.response.text[:500] if exc.response is not None else ""
+        log(ip, f"vManage: config group deploy FAILED: {exc}  body={body!r}", console=True)
         with state_lock:
             vmanage_status[ip] = "FAILED"
+        if disassociated:
+            _vmanage_rollback_to_onboard(ip, uuid)
+    except Exception as exc:
+        log(ip, f"vManage: config group deploy FAILED: {exc}", console=True)
+        with state_lock:
+            vmanage_status[ip] = "FAILED"
+        if disassociated:
+            _vmanage_rollback_to_onboard(ip, uuid)
 
     save_status()
 
@@ -1135,6 +1370,8 @@ def main() -> None:
 
     if not vmanage_login():
         print("WARNING: vManage login failed — config group moves will be skipped\n")
+
+    load_csv_vars()
 
     ips, display_order = extract_172_ips(PING_FILE)
     if not ips:

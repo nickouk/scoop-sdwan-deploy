@@ -58,6 +58,20 @@ Each CEDGE is initially assigned to the **onboarding** config group for the code
 | `5607f32e-7391-4241-95a6-c2ac5b4d17fd` | `poc_nicko` | PoC / testing |
 | `f5ea86ef-8f5c-4319-a518-6c169b9d7025` | `icon_hubs` | Hub sites |
 
+**Config group deploy sequence (step 3) — confirmed working:**
+1. `DELETE /v1/config-group/{onboard-uuid}/device/associate` — body: `{"devices": [{"id": uuid}]}`
+2. `POST   /v1/config-group/{final-uuid}/device/associate`   — body: `{"devices": [{"id": uuid}]}` (no variables)
+3. `PUT    /v1/config-group/{final-uuid}/device/variables`   — body: `{"solution": "sdwan", "devices": [{"device-id": uuid, "variables": [{name, value}...]}]}`
+4. `POST   /v1/config-group/{final-uuid}/device/deploy`      — body: `{"devices": [{"id": uuid}]}`
+
+**Variable format for step 3:**
+- Variables are a `[{name, value}]` list — NOT a flat dict
+- Variable names are snake_case (e.g. `system_ip`, `vlan10_ipv4`)
+- 5 CSV column headers need remapping: `"System IP"→system_ip`, `"Host Name"→host_name`, `"Site Id"→site_id`, `"Dual Stack IPv6 Default"→ipv6_strict_control`, `"Rollback Timer (sec)"→pseudo_commit_timer`
+- Value types must match the schema: int, float, bool, str, or list
+- `*_dhcp_exclude` variables are `list[str]`; CSV encodes multiple ranges with `";"` delimiter (e.g. `"10.0.0.1-10.0.0.63";"10.0.0.124-10.0.0.126"`)
+- Variable names and types are discovered at runtime by GETting `/device/variables` for an existing device in the same group
+
 **Config group selection logic (final):**
 ```
 SITE-TYPE in {3, 4}  →  type34_r1_pppoe_r2_pppoe
@@ -87,6 +101,24 @@ BFD sessions to both hubs must be up as part of the verification pass criteria.
 
 ---
 
+## vManage Import CSV
+
+**Path:** `/mnt/c/Users/nick.oneill/OneDrive - Maintel Europe Limited/Southern Coops - Rollout docs/vmanage-import-sc.csv`
+
+This CSV contains all per-device template variables required to associate and deploy a config group in vManage. It is the authoritative source for device variables — do not hardcode these values in the script.
+
+| Column | Meaning |
+|--------|---------|
+| `Device ID` | Chassis serial number (identifier only — excluded from template variables) |
+| `System IP` | Management/system IP — used as the lookup key to match a dashboard device to its CSV row |
+| `Host Name` | Device hostname |
+| `Site Id` | Numeric site ID (e.g. `30007`) |
+| *(remaining 111 columns)* | VLAN configs, WAN settings, PPPoE credentials, QoS, NAT, etc. |
+
+The script loads this file at startup (`load_csv_vars()`) into a dict keyed by System IP, then passes **all columns except `Device ID`** as template variables when associating a device with its final config group.
+
+---
+
 ## Verification Pass Criteria
 
 A site is considered **live** only when **all** of the following are true:
@@ -111,7 +143,9 @@ source ~/my-venv/bin/activate
 python code-upgrade.py
 ```
 
-The script prompts for two credential sets at startup: **local** (device-local user) and **ISE** (RADIUS/TACACS fallback). It reads target IPs from the multiping file at `PING_FILE` (a Windows path via WSL: `/mnt/c/Users/nick.oneill/Tools/multiping/pingips.txt`).
+The script prompts for three credential sets at startup: **local** (device-local user), **ISE** (RADIUS/TACACS fallback), and **vManage** (for config group deployment).
+
+It reads target IPs from the multiping file at `PING_FILE` (a Windows path via WSL: `/mnt/c/Users/nick.oneill/Tools/multiping/pingips.txt`).
 
 ## Key constants (top of file)
 
@@ -121,6 +155,7 @@ The script prompts for two credential sets at startup: **local** (device-local u
 | `TARGET_VERSION` | `17.15.04c.0.107` | Version to upgrade to |
 | `OLD_VERSION` | `17.12.05a.0.159` | Version to remove after upgrade |
 | `INSTALL_FILE` | `bootflash:c1100-universalk9.17.15.04c.SPA.bin` | Expected location of installer |
+| `CSV_VARS_FILE` | OneDrive path via WSL | Per-device vManage template variables |
 | `UP_THRESHOLD` | 30s | Continuous uptime before upgrade starts |
 | `RETRY_DELAY` | 300s | Wait before retrying a failed device |
 
