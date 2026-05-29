@@ -1369,7 +1369,8 @@ def main() -> None:
     prompt_credentials()
 
     if not vmanage_login():
-        print("WARNING: vManage login failed — config group moves will be skipped\n")
+        print("ERROR: vManage login failed — cannot continue without a vManage session.")
+        sys.exit(1)
 
     load_csv_vars()
 
