@@ -4,9 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## API Reference
 
+**vManage Live API Docs (Swagger UI)**: https://vmanage-953677893.sdwan.cisco.com:8443/apidocs
+*(requires a vManage user account to access)*
+
+**Cisco SD-WAN 20.15 API Documentation**: https://developer.cisco.com/docs/sdwan/20-15/
+
+Official Cisco developer documentation for the vManage REST API matching the controller version in use. Use this as the primary reference for endpoint signatures, request/response schemas, and feature availability.
+
 **Cisco Catalyst WAN SDK**: https://github.com/cisco-open/cisco-catalyst-wan-sdk
 
-This open-source Python SDK is the authoritative reference for constructing vManage REST API calls. When an API endpoint or request format is unclear, consult the SDK source — particularly:
+Open-source Python SDK wrapping the vManage API. Useful for discovering working API call patterns when the official docs are unclear — particularly:
 - `catalystwan/api/speedtest_api.py` — speedtest flow (`/dataservice/stream/device/speed`)
 - `catalystwan/api/basic_api.py` — device state methods (BFD colors, data stream enable)
 - `catalystwan/api/` — other API wrappers organised by feature area
@@ -17,16 +24,21 @@ The SDK uses `catalystwan.session` for authenticated requests; the equivalent in
 
 ## Deployment Pipeline
 
-This repository is **Step 2** of a broader SD-WAN deployment pipeline for migrating sites to a Cisco IOS-XE SD-WAN solution.
+All pipeline stages are implemented inside `code-upgrade.py` and run automatically in sequence per device once triggered.
 
-| Step | Script | Purpose |
-|------|--------|---------|
-| 1 | *(ping monitor — embedded in step 2)* | Confirm sites are reachable and stable |
-| 2 | `code-upgrade.py` | Upgrade IOS-XE software to the target SD-WAN version |
-| 3 | *(future)* | Move devices to final config group once code version confirmed |
-| 4 | *(future)* | Verification pass — confirm site is live |
+| Stage | Function(s) | Trigger | Dashboard column |
+|-------|-------------|---------|-----------------|
+| 1 — Ping monitor | `ping_loop` | Continuous from startup | CODE STATUS: `Up (Xs / 30s)` |
+| 2 — Code upgrade | `upgrade_device` | Device stable for 30s | CODE STATUS: step labels → `UPGRADE COMPLETE` |
+| 3 — Config group deploy | `move_to_final_config_group` | Upgrade complete | CONFIG: `ASSOCIATING` → `SETTING VARS` → `DEPLOYING` → `DEPLOYED` |
+| 4 — Speed test | `run_speedtest` | Config deployed AND circuit CONNECTED | SPEED: `WAIT CIRCUIT` → `RUNNING` → `↓XX ↑XX Mbps` |
+| 5 — Policy group deploy | `deploy_policy_group` | CONFIG DEPLOYED for all site routers AND one speedtest complete | POLICY: `WAITING` → `ASSOCIATING` → `SETTING VARS` → `DEPLOYING` → `DEPLOYED` |
+| 6 — Ready alert | Dashboard `print_status` | Speed test passed (one alert per site) | Bottom of dashboard: `*** <hostname> is READY for SWITCH ***` |
+| 7 — Switch detected | `_collect_device_info` | G0/1/0 or G0/1/7 goes UP | Alert cleared automatically |
 
-Each step runs against the same IP list (sourced from the multiping file) and should produce a clear pass/fail status per site before the next step begins.
+**Background threads:**
+- `info_collector_loop` — polls CONFIG / POLICY / CIRCUIT / SWITCHPORTS via SSH every 60s for all non-upgrading devices
+- `_poll_vmanage_tasks` — polls vManage for active tasks every 30s; shown below the dashboard
 
 ---
 
@@ -70,6 +82,24 @@ Each CEDGE is initially assigned to the **onboarding** config group for the code
 | `77da43d2-1f81-4ab2-8aac-ce76512136fb` | `onboard_1127X` | Onboarding — 1127X hardware |
 | `5607f32e-7391-4241-95a6-c2ac5b4d17fd` | `poc_nicko` | PoC / testing |
 | `f5ea86ef-8f5c-4319-a518-6c169b9d7025` | `icon_hubs` | Hub sites |
+
+### Policy Groups
+
+| UUID | Name | Used when |
+|------|------|-----------|
+| `ade1666a-8d3c-4ba3-a641-b38a129eeda3` | `remote_sites_policy_group` | All remote sites (stage 5 deploy) |
+| `b7e4d243-b4ff-498f-80db-9df3a87a299d` | `icon_policy_group` | Hub sites |
+
+**Policy group deploy sequence (stage 5) — same pattern as config group:**
+1. `POST /v1/policy-group/{uuid}/device/associate` — body: `{"devices": [{"id": uuid}]}`
+2. Wait for vManage idle
+3. `PUT  /v1/policy-group/{uuid}/device/variables` — body: `{"solution": "sdwan", "devices": [{"device-id": uuid, "variables": [...]}]}` *(non-fatal if endpoint returns non-200)*
+4. `POST /v1/policy-group/{uuid}/device/deploy`    — body: `{"devices": [{"id": uuid}]}`
+
+**Trigger conditions for policy deploy:**
+- All routers at the site have `vmanage_status == "DEPLOYED"` (CONFIG complete for both R1 and R2)
+- At least one router at the site has a completed speedtest result (starts with `↓`)
+- No other vManage tasks running at time of submission (`_wait_for_vmanage_idle`)
 
 **Config group deploy sequence (step 3) — confirmed working:**
 1. `DELETE /v1/config-group/{onboard-uuid}/device/associate` — body: `{"devices": [{"id": uuid}]}`

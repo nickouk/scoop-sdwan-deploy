@@ -34,17 +34,36 @@ CONFIG_GROUP_ENDPOINTS = [
     "/dataservice/configgroup",
 ]
 
+POLICY_GROUP_ENDPOINTS = [
+    "/dataservice/v1/policy-group",
+    "/dataservice/template/policy-group",
+    "/dataservice/policygroup",
+]
 
-def list_config_groups(session):
-    for path in CONFIG_GROUP_ENDPOINTS:
+
+def list_groups(session, endpoints, label):
+    for path in endpoints:
         resp = session.get(f"{VMANAGE_URL}{path}")
         if resp.status_code == 200:
             return resp.json()
         if resp.status_code != 404:
             resp.raise_for_status()
     raise RuntimeError(
-        f"Could not find config groups endpoint. Tried: {CONFIG_GROUP_ENDPOINTS}"
+        f"Could not find {label} endpoint. Tried: {endpoints}"
     )
+
+
+def print_groups(data, id_keys, name_keys):
+    groups = data if isinstance(data, list) else data.get("data", [])
+    if not groups:
+        return 0
+    print(f"  {'ID':<40}  {'Name'}")
+    print("  " + "-" * 78)
+    for g in groups:
+        gid  = next((g[k] for k in id_keys   if k in g), "N/A")
+        name = next((g[k] for k in name_keys if k in g), "N/A")
+        print(f"  {gid:<40}  {name}")
+    return len(groups)
 
 
 def main():
@@ -55,23 +74,18 @@ def main():
     print("\nAuthenticating...")
     session = get_session(username, password)
 
-    print("Fetching configuration groups...\n")
-    data = list_config_groups(session)
+    print("\n── Configuration Groups ──────────────────────────────────────────────")
+    data = list_groups(session, CONFIG_GROUP_ENDPOINTS, "config groups")
+    n = print_groups(data, ["id", "configGroupId"], ["name", "configGroupName"])
+    print(f"\n  Total: {n} group(s)")
 
-    groups = data if isinstance(data, list) else data.get("data", [])
-
-    if not groups:
-        print("No configuration groups found.")
-        return
-
-    print(f"{'ID':<40}  {'Name'}")
-    print("-" * 80)
-    for g in groups:
-        gid = g.get("id", g.get("configGroupId", "N/A"))
-        name = g.get("name", g.get("configGroupName", "N/A"))
-        print(f"{gid:<40}  {name}")
-
-    print(f"\nTotal: {len(groups)} group(s)")
+    print("\n── Policy Groups ─────────────────────────────────────────────────────")
+    try:
+        data = list_groups(session, POLICY_GROUP_ENDPOINTS, "policy groups")
+        n = print_groups(data, ["id", "policyGroupId"], ["name", "policyGroupName"])
+        print(f"\n  Total: {n} group(s)")
+    except RuntimeError as e:
+        print(f"  {e}")
 
 
 if __name__ == "__main__":

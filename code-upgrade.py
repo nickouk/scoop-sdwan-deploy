@@ -43,6 +43,7 @@ SPEEDTEST_DST_IP      = "172.31.116.1"    # SC-1-0001-THN-R1
 SPEEDTEST_DST_COLOR   = "public-internet"
 SPEEDTEST_SRC_COLOR   = {"1": "blue", "2": "green"}   # keyed by device index (R1/R2)
 VMANAGE_ONBOARD_UUID = "8cd9fc8a-a552-41be-95f5-42fc4bcc6ad9"
+VMANAGE_POLICY_GROUP_UUID = "ade1666a-8d3c-4ba3-a641-b38a129eeda3"  # remote_sites_policy_group
 VMANAGE_FINAL_GROUPS = {
     "3": "90edb92d-05e9-4887-886c-fea0ef535422",
     "4": "90edb92d-05e9-4887-886c-fea0ef535422",
@@ -92,6 +93,7 @@ bin_missing:          set[str]        = set() # IPs that failed because install 
 file_copying:         set[str]        = set() # IPs where .bin exists but copy is still in progress
 wan_ip_cache:         dict[str, str]  = {}   # ip -> last known WAN/Dialer1 IP
 vmanage_status:       dict[str, str]  = {}   # ip -> config group move status
+policy_status:        dict[str, str]  = {}   # ip -> policy group deploy status
 speedtest_status:     dict[str, str]  = {}   # ip -> speedtest result or status label
 ready_for_switch:     dict[str, str]  = {}    # site-key -> hostname of first device that passed speedtest
 _speedtest_sem        = threading.Semaphore(1)  # only one speedtest at a time
@@ -139,6 +141,8 @@ def save_status() -> None:
                 devices[ip]["device_info"] = device_info[ip]
             if ip in vmanage_status:
                 devices[ip]["vmanage_status"] = vmanage_status[ip]
+            if ip in policy_status:
+                devices[ip]["policy_status"] = policy_status[ip]
             if ip in speedtest_status:
                 devices[ip]["speedtest_status"] = speedtest_status[ip]
 
@@ -192,6 +196,13 @@ def load_status(ips: list[str]) -> None:
             vm_st = entry.get("vmanage_status")
             if vm_st:
                 vmanage_status[ip] = vm_st
+            pol_st = entry.get("policy_status")
+            if pol_st:
+                # Reset mid-deploy states so they retry on restart
+                if pol_st in ("ASSOCIATING", "SETTING VARS", "DEPLOYING", "WAITING"):
+                    pol_st = None
+                if pol_st:
+                    policy_status[ip] = pol_st
             sp_st = entry.get("speedtest_status")
             if sp_st:
                 speedtest_status[ip] = sp_st
@@ -639,6 +650,184 @@ def _vmanage_rollback_to_onboard(ip: str, uuid: str | None) -> None:
         log(ip, f"vManage: rollback error: {exc}", console=True)
 
 
+def _try_trigger_policy_for_site(trigger_ip: str) -> None:
+    """
+    Check if all conditions are met to deploy the policy group for this site:
+      - Every router at the site has vmanage_status == "DEPLOYED" (CONFIG complete)
+      - At least one router at the site has a completed speedtest (↓XX ↑XX Mbps)
+    If conditions are met, atomically claims any un-started IPs and spawns
+    deploy_policy_group threads for them.
+    """
+    with state_lock:
+        hostname = hostnames.get(trigger_ip, "")
+        if not hostname:
+            return
+        site_key = re.sub(r'-R\d+$', '', hostname)
+
+        site_ips = [
+            ip for ip, hn in hostnames.items()
+            if re.sub(r'-R\d+$', '', hn) == site_key
+        ]
+        if not site_ips:
+            return
+
+        for ip in site_ips:
+            if vmanage_status.get(ip) != "DEPLOYED":
+                log(trigger_ip, f"Policy trigger: waiting — {ip} CONFIG not yet DEPLOYED ({vmanage_status.get(ip, 'N/A')})")
+                return
+
+        speedtest_done = any(
+            str(speedtest_status.get(ip, '')).startswith('↓')
+            for ip in site_ips
+        )
+        if not speedtest_done:
+            log(trigger_ip, "Policy trigger: waiting — no speedtest complete for site yet")
+            return
+
+        needs_policy = [
+            ip for ip in site_ips
+            if policy_status.get(ip) not in (
+                "WAITING", "ASSOCIATING", "SETTING VARS", "DEPLOYING", "DEPLOYED", "FAILED"
+            )
+        ]
+        for ip in needs_policy:
+            policy_status[ip] = "WAITING"
+
+    for ip in needs_policy:
+        log(ip, f"Triggering policy group deployment (site {site_key})", console=True)
+        threading.Thread(target=deploy_policy_group, args=(ip,), daemon=True).start()
+
+
+def deploy_policy_group(ip: str) -> None:
+    """Associate and deploy the policy group for this device. Runs in its own thread."""
+    if not vmanage_session:
+        log(ip, "vManage: no session — skipping policy group deploy", console=True)
+        with state_lock:
+            policy_status[ip] = "SKIPPED"
+        save_status()
+        return
+
+    if not _wait_for_vmanage_idle(ip):
+        log(ip, "vManage: timed out waiting for tasks to clear before policy deploy", console=True)
+        with state_lock:
+            policy_status[ip] = "FAILED"
+        save_status()
+        return
+
+    try:
+        uuid = _vmanage_get_device_uuid(ip)
+        if not uuid:
+            raise ValueError(f"device UUID not found for system-ip {ip}")
+
+        csv_row = csv_vars.get(ip)
+        if not csv_row:
+            raise ValueError(f"no CSV variables found for system-ip {ip}")
+
+        # ── Step 1: Associate with policy group ───────────────────────────────
+        with state_lock:
+            policy_status[ip] = "ASSOCIATING"
+        log(ip, "vManage: associating with policy group", console=True)
+        resp = vmanage_session.post(
+            f"{VMANAGE_BASE_URL}/dataservice/v1/policy-group/{VMANAGE_POLICY_GROUP_UUID}/device/associate",
+            json={"devices": [{"id": uuid}]},
+            timeout=60,
+        )
+        if not resp.ok:
+            log(ip, f"vManage: policy associate HTTP {resp.status_code} — {resp.text[:500]!r}", console=True)
+        resp.raise_for_status()
+        log(ip, f"vManage: policy associate successful (HTTP {resp.status_code})", console=True)
+
+        # ── Step 2: Wait after associate ──────────────────────────────────────
+        with state_lock:
+            policy_status[ip] = "WAITING"
+        if not _wait_for_vmanage_idle(ip):
+            raise ValueError("timed out waiting after policy associate")
+
+        # ── Step 3: Set variables ─────────────────────────────────────────────
+        with state_lock:
+            policy_status[ip] = "SETTING VARS"
+        log(ip, "vManage: setting policy group variables", console=True)
+        var_list = _vmanage_build_variable_list(ip, VMANAGE_POLICY_GROUP_UUID, uuid, csv_row,
+                                                group_type="policy-group")
+        resp = vmanage_session.put(
+            f"{VMANAGE_BASE_URL}/dataservice/v1/policy-group/{VMANAGE_POLICY_GROUP_UUID}/device/variables",
+            json={"solution": "sdwan", "devices": [{"device-id": uuid, "variables": var_list}]},
+            timeout=60,
+        )
+        if not resp.ok:
+            log(ip, f"vManage: policy variables HTTP {resp.status_code} — {resp.text[:500]!r}", console=True)
+        resp.raise_for_status()
+        log(ip, f"vManage: policy variables set (HTTP {resp.status_code})", console=True)
+
+        # ── Step 4: Deploy ────────────────────────────────────────────────────
+        with state_lock:
+            policy_status[ip] = "DEPLOYING"
+        log(ip, "vManage: deploying policy group to device", console=True)
+        resp = vmanage_session.post(
+            f"{VMANAGE_BASE_URL}/dataservice/v1/policy-group/{VMANAGE_POLICY_GROUP_UUID}/device/deploy",
+            json={"devices": [{"id": uuid}]},
+            timeout=60,
+        )
+        if not resp.ok:
+            log(ip, f"vManage: policy deploy HTTP {resp.status_code} — {resp.text[:500]!r}", console=True)
+        resp.raise_for_status()
+
+        # ── Step 5: Poll task until vManage reports completion ─────────────────
+        action_id = None
+        try:
+            action_id = resp.json().get("id")
+        except Exception:
+            pass
+
+        if action_id:
+            log(ip, f"vManage: policy deploy task {action_id} — polling for completion", console=True)
+            deadline = time.time() + 1800  # 30 min timeout
+            while time.time() < deadline:
+                time.sleep(15)
+                try:
+                    r = vmanage_session.get(
+                        f"{VMANAGE_BASE_URL}/dataservice/device/action/status/{action_id}",
+                        timeout=15,
+                    )
+                    if not r.ok:
+                        log(ip, f"vManage: policy task poll HTTP {r.status_code} — retrying")
+                        continue
+                    body = r.json()
+                    summary_status = body.get("summary", {}).get("status", "")
+                    log(ip, f"vManage: policy task {action_id} status={summary_status!r}")
+                    if summary_status.lower() in ("done",):
+                        device_results = body.get("data", [])
+                        failures = [d for d in device_results if d.get("status", "").lower() == "failure"]
+                        if failures:
+                            raise ValueError(f"policy deploy task reported failure: {failures[0].get('activity', failures[0])}")
+                        break
+                    elif summary_status.lower() in ("error", "failed"):
+                        raise ValueError(f"policy deploy task failed with status: {summary_status!r}")
+                except ValueError:
+                    raise
+                except Exception as exc:
+                    log(ip, f"vManage: policy task poll error: {exc}")
+            else:
+                raise ValueError("policy deploy task did not complete within 30 minutes")
+        else:
+            log(ip, "vManage: policy deploy response had no action ID — cannot poll task", console=True)
+
+        with state_lock:
+            policy_status[ip] = "DEPLOYED"
+
+    except requests.HTTPError as exc:
+        body = exc.response.text[:500] if exc.response is not None else ""
+        log(ip, f"vManage: policy deploy FAILED: {exc}  body={body!r}", console=True)
+        with state_lock:
+            policy_status[ip] = "FAILED"
+    except Exception as exc:
+        log(ip, f"vManage: policy deploy FAILED: {exc}", console=True)
+        with state_lock:
+            policy_status[ip] = "FAILED"
+
+    save_status()
+
+
 def run_speedtest(ip: str) -> None:
     """
     Run a speedtest from this device to the THN hub. Runs in its own thread.
@@ -814,6 +1003,8 @@ def _run_speedtest(ip: str, src_color: str) -> None:
                 ready_for_switch[site_key] = hostname
                 log(ip, f"{hostname} is READY for SWITCH", console=True)
 
+        _try_trigger_policy_for_site(ip)
+
     except Exception as exc:
         log(ip, f"Speedtest FAILED: {exc}", console=True)
         with state_lock:
@@ -822,9 +1013,10 @@ def _run_speedtest(ip: str, src_color: str) -> None:
     save_status()
 
 
-def _vmanage_build_variable_list(ip: str, target_group: str, uuid: str, csv_row: dict) -> list[dict]:
+def _vmanage_build_variable_list(ip: str, target_group: str, uuid: str, csv_row: dict,
+                                  group_type: str = "config-group") -> list[dict]:
     """
-    Build [{name, value}] for PUT /v1/config-group/{id}/device/variables.
+    Build [{name, value}] for PUT /v1/{group_type}/{id}/device/variables.
 
     GETs the full variable list from an existing device in the group to learn
     variable names and their correct Python types.  Falls back to smart
@@ -837,7 +1029,7 @@ def _vmanage_build_variable_list(ip: str, target_group: str, uuid: str, csv_row:
 
     try:
         resp = vmanage_session.get(
-            f"{VMANAGE_BASE_URL}/dataservice/v1/config-group/{target_group}/device/variables",
+            f"{VMANAGE_BASE_URL}/dataservice/v1/{group_type}/{target_group}/device/variables",
             timeout=15,
         )
         if resp.ok:
@@ -1044,6 +1236,7 @@ def move_to_final_config_group(ip: str) -> None:
             speedtest_status[ip] = "PENDING"
 
         threading.Thread(target=run_speedtest, args=(ip,), daemon=True).start()
+        _try_trigger_policy_for_site(ip)
 
     except requests.HTTPError as exc:
         body = exc.response.text[:500] if exc.response is not None else ""
@@ -1513,7 +1706,8 @@ def print_status(display_order: list[str], now: float) -> None:
                     cfg = vm_st
                 else:
                     cfg = cfg_device
-                policy  = info.get('policy',  '')
+                pol_deploy = policy_status.get(ip, '')
+                policy = pol_deploy if pol_deploy and pol_deploy != "FAILED" else info.get('policy', '')
                 if ip in circuit_ping_offline:
                     wan_ip  = wan_ip_cache.get(ip, '')
                     circuit = f"OFFLINE ({wan_ip})" if wan_ip else "OFFLINE"
@@ -1620,6 +1814,16 @@ def main() -> None:
     for ip in pending_speedtests:
         log(ip, "Resuming speedtest from previous run", console=True)
         threading.Thread(target=run_speedtest, args=(ip,), daemon=True).start()
+
+    # Resume any policy deployments that didn't complete in a previous run
+    with state_lock:
+        resume_policy_candidates = [
+            ip for ip in ips
+            if vmanage_status.get(ip) == "DEPLOYED"
+            and policy_status.get(ip) not in ("DEPLOYED", "FAILED", "SKIPPED")
+        ]
+    for ip in resume_policy_candidates:
+        _try_trigger_policy_for_site(ip)
 
     print(f"Found {len(ips)} target IP(s):\n  " + "\n  ".join(ips))
     print(f"\nMonitoring — upgrade triggers after {UP_THRESHOLD}s continuous uptime\n")
