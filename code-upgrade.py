@@ -93,6 +93,8 @@ file_copying:         set[str]        = set() # IPs where .bin exists but copy i
 wan_ip_cache:         dict[str, str]  = {}   # ip -> last known WAN/Dialer1 IP
 vmanage_status:       dict[str, str]  = {}   # ip -> config group move status
 speedtest_status:     dict[str, str]  = {}   # ip -> speedtest result or status label
+ready_for_switch:     dict[str, str]  = {}    # site-key -> hostname of first device that passed speedtest
+_speedtest_sem        = threading.Semaphore(1)  # only one speedtest at a time
 csv_vars:             dict[str, dict]  = {}   # system-ip -> full variable row from CSV
 vmanage_tasks:        list[dict]      = []   # active tasks polled from vManage API
 vmanage_tasks_lock    = threading.Lock()
@@ -482,6 +484,14 @@ def collect_device_info(client: paramiko.SSHClient, ip: str) -> paramiko.SSHClie
             sw_labels.append('TEMP PORTS IN USE')
         info['switchports'] = ' | '.join(sw_labels)
         log(ip, f"SWITCHPORTS: {info['switchports']}")
+
+        hostname = hostnames.get(ip, ip)
+        site_key = re.sub(r'-R\d+$', '', hostname)
+        if (iface_up.get('0/1/0') or iface_up.get('0/1/7')) and site_key in ready_for_switch:
+            active = 'G0/1/0' if iface_up.get('0/1/0') else 'G0/1/7'
+            with state_lock:
+                ready_for_switch.pop(site_key, None)
+            log(ip, f"{hostname}: {active} now UP — SWITCH underway, clearing READY message", console=True)
     except Exception as exc:
         log(ip, f"CIRCUIT collect error: {type(exc).__name__}: {exc}")
 
@@ -630,7 +640,14 @@ def _vmanage_rollback_to_onboard(ip: str, uuid: str | None) -> None:
 
 
 def run_speedtest(ip: str) -> None:
-    """Run a speedtest from this device to the THN hub. Runs in its own thread."""
+    """
+    Run a speedtest from this device to the THN hub. Runs in its own thread.
+
+    Phase 1 (outside semaphore): pre-flight checks and CIRCUIT wait.
+    Phase 2 (inside semaphore):  actual vManage API calls — serialised so only
+                                 one test runs at a time.
+    """
+    # ── Phase 1: pre-flight (no semaphore — circuit wait can take 30 min) ─────
     if not vmanage_session:
         log(ip, "Speedtest: no vManage session — skipping", console=True)
         with state_lock:
@@ -647,27 +664,6 @@ def run_speedtest(ip: str) -> None:
         save_status()
         return
 
-    # Wait for CIRCUIT: CONNECTED before running the test (up to 10 minutes)
-    with state_lock:
-        circuit = device_info.get(ip, {}).get('circuit', '')
-    if circuit != 'CONNECTED':
-        log(ip, "Speedtest: waiting for CIRCUIT CONNECTED…", console=True)
-        with state_lock:
-            speedtest_status[ip] = "WAIT CIRCUIT"
-        deadline = time.time() + 600
-        while time.time() < deadline:
-            time.sleep(15)
-            with state_lock:
-                circuit = device_info.get(ip, {}).get('circuit', '')
-            if circuit == 'CONNECTED':
-                break
-        if circuit != 'CONNECTED':
-            log(ip, "Speedtest: CIRCUIT not CONNECTED after 10 minutes — skipping", console=True)
-            with state_lock:
-                speedtest_status[ip] = "SKIPPED"
-            save_status()
-            return
-
     device_index = m.group(1)
     src_color = SPEEDTEST_SRC_COLOR.get(device_index)
     if not src_color:
@@ -677,6 +673,40 @@ def run_speedtest(ip: str) -> None:
         save_status()
         return
 
+    # Wait for CIRCUIT: CONNECTED (outside semaphore so blocked devices don't
+    # prevent other ready devices from running their tests)
+    with state_lock:
+        circuit = device_info.get(ip, {}).get('circuit', '')
+    if not circuit.startswith('CONNECTED'):
+        log(ip, "Speedtest: waiting for CIRCUIT CONNECTED…", console=True)
+        with state_lock:
+            speedtest_status[ip] = "WAIT CIRCUIT"
+        deadline = time.time() + 1800
+        last_logged = ""
+        while True:
+            with state_lock:
+                circuit = device_info.get(ip, {}).get('circuit', '')
+                ip_in_dev_info = ip in device_info
+            if circuit != last_logged:
+                log(ip, f"Speedtest: CIRCUIT check — value={circuit!r}  in_device_info={ip_in_dev_info}", console=True)
+                last_logged = circuit
+            if circuit.startswith('CONNECTED'):
+                log(ip, "Speedtest: CIRCUIT now CONNECTED — proceeding", console=True)
+                break
+            if time.time() >= deadline:
+                log(ip, "Speedtest: CIRCUIT not CONNECTED after 30 minutes — skipping", console=True)
+                with state_lock:
+                    speedtest_status[ip] = "SKIPPED"
+                save_status()
+                return
+            time.sleep(10)
+
+    # ── Phase 2: run the test (serialised) ────────────────────────────────────
+    with _speedtest_sem:
+        _run_speedtest(ip, src_color)
+
+
+def _run_speedtest(ip: str, src_color: str) -> None:
     with state_lock:
         speedtest_status[ip] = "RUNNING"
 
@@ -776,8 +806,13 @@ def run_speedtest(ip: str) -> None:
         ul = result.get("up_speed", 0)
         label = f"↓{dl:.1f} ↑{ul:.1f} Mbps"
         log(ip, f"Speedtest: {label}  circuit={result.get('source_circuit')}→{result.get('destination_circuit')}", console=True)
+        hostname = hostnames.get(ip, ip)
+        site_key = re.sub(r'-R\d+$', '', hostname)  # e.g. SC-3-0079
         with state_lock:
             speedtest_status[ip] = label
+            if site_key not in ready_for_switch:
+                ready_for_switch[site_key] = hostname
+                log(ip, f"{hostname} is READY for SWITCH", console=True)
 
     except Exception as exc:
         log(ip, f"Speedtest FAILED: {exc}", console=True)
@@ -1489,6 +1524,14 @@ def print_status(display_order: list[str], now: float) -> None:
             print(f"  {ip:<20}  {hostnames.get(ip, ''):<14}  {state:<34}  {cfg:<10}  {speed:<20}  {policy:<10}  {circuit:<28}  {switchports:<40}")
         print(f"{'─'*_DASH_WIDTH}  [{ts()}]")
 
+        # Ready-for-switch alerts
+        with state_lock:
+            rfs_snapshot = dict(ready_for_switch)
+        if rfs_snapshot:
+            print()
+            for _, rfs_host in sorted(rfs_snapshot.items()):
+                print(f"  *** {rfs_host} is READY for SWITCH ***")
+
         # vManage task summary (live from vManage API)
         print()
         if not vmanage_session:
@@ -1571,7 +1614,7 @@ def main() -> None:
         pending_speedtests = [
             ip for ip in ips
             if vmanage_status.get(ip) == "DEPLOYED"
-            and speedtest_status.get(ip) in ("PENDING", "RUNNING", None)
+            and speedtest_status.get(ip) in ("PENDING", "RUNNING", "WAIT CIRCUIT", "SKIPPED", None)
             and ip not in {p for p in pending_moves}
         ]
     for ip in pending_speedtests:

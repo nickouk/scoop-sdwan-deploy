@@ -198,7 +198,10 @@ State is persisted to `upgrade_status.json` (atomic rename via temp file) after 
 
 - Sites have two routers (R1, R2). Whichever router has the live WAN circuit shows `CIRCUIT: CONNECTED`; the other shows `CIRCUIT: NOT CONNECTED`.
 - Both are still reachable via SSH — they use **peer TLOC extension**, meaning either router can use the other's WAN circuit. `NOT CONNECTED` does not mean the device is offline.
-- G0/1/0 is the switch trunk port, up when the site is live on SD-WAN or ready for migration. G0/1/7 is the provisioning port. G0/1/1–6 are temporary connections.
+- **G0/1/0** — switch **live** port (connects router to site's production switch once migration is complete)
+- **G0/1/7** — switch **provisioning** port (used during rollout to connect router to the existing switch for the migration handover)
+- G0/1/1–6 — temporary connections
+- Either G0/1/0 or G0/1/7 going UP indicates the physical switch handover is underway and the site no longer needs a READY FOR SWITCH alert
 
 ## SSH behaviour
 
