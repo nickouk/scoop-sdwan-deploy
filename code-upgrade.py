@@ -38,7 +38,10 @@ REBOOT_POLL     = 10          # seconds between reboot connectivity checks
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STATUS_FILE = os.path.join(_SCRIPT_DIR, "upgrade_status.json")
 
-VMANAGE_BASE_URL     = "https://vmanage-953677893.sdwan.cisco.com:8443"
+VMANAGE_BASE_URL      = "https://vmanage-953677893.sdwan.cisco.com:8443"
+SPEEDTEST_DST_IP      = "172.31.116.1"    # SC-1-0001-THN-R1
+SPEEDTEST_DST_COLOR   = "public-internet"
+SPEEDTEST_SRC_COLOR   = {"1": "blue", "2": "green"}   # keyed by device index (R1/R2)
 VMANAGE_ONBOARD_UUID = "8cd9fc8a-a552-41be-95f5-42fc4bcc6ad9"
 VMANAGE_FINAL_GROUPS = {
     "3": "90edb92d-05e9-4887-886c-fea0ef535422",
@@ -89,6 +92,7 @@ bin_missing:          set[str]        = set() # IPs that failed because install 
 file_copying:         set[str]        = set() # IPs where .bin exists but copy is still in progress
 wan_ip_cache:         dict[str, str]  = {}   # ip -> last known WAN/Dialer1 IP
 vmanage_status:       dict[str, str]  = {}   # ip -> config group move status
+speedtest_status:     dict[str, str]  = {}   # ip -> speedtest result or status label
 csv_vars:             dict[str, dict]  = {}   # system-ip -> full variable row from CSV
 vmanage_tasks:        list[dict]      = []   # active tasks polled from vManage API
 vmanage_tasks_lock    = threading.Lock()
@@ -133,6 +137,8 @@ def save_status() -> None:
                 devices[ip]["device_info"] = device_info[ip]
             if ip in vmanage_status:
                 devices[ip]["vmanage_status"] = vmanage_status[ip]
+            if ip in speedtest_status:
+                devices[ip]["speedtest_status"] = speedtest_status[ip]
 
     data = {"last_updated": now_str, "devices": devices}
     tmp = STATUS_FILE + ".tmp"
@@ -184,6 +190,9 @@ def load_status(ips: list[str]) -> None:
             vm_st = entry.get("vmanage_status")
             if vm_st:
                 vmanage_status[ip] = vm_st
+            sp_st = entry.get("speedtest_status")
+            if sp_st:
+                speedtest_status[ip] = sp_st
             msgs.append(f"  {ip:<20}  {hostname:<28}  {label} (skipping)")
 
         elif status == "retry":
@@ -620,6 +629,164 @@ def _vmanage_rollback_to_onboard(ip: str, uuid: str | None) -> None:
         log(ip, f"vManage: rollback error: {exc}", console=True)
 
 
+def run_speedtest(ip: str) -> None:
+    """Run a speedtest from this device to the THN hub. Runs in its own thread."""
+    if not vmanage_session:
+        log(ip, "Speedtest: no vManage session — skipping", console=True)
+        with state_lock:
+            speedtest_status[ip] = "SKIPPED"
+        save_status()
+        return
+
+    hostname = hostnames.get(ip, "")
+    m = re.search(r'-R(\d+)$', hostname)
+    if not m:
+        log(ip, f"Speedtest: cannot determine R1/R2 from hostname {hostname!r} — skipping", console=True)
+        with state_lock:
+            speedtest_status[ip] = "SKIPPED"
+        save_status()
+        return
+
+    # Wait for CIRCUIT: CONNECTED before running the test (up to 10 minutes)
+    with state_lock:
+        circuit = device_info.get(ip, {}).get('circuit', '')
+    if circuit != 'CONNECTED':
+        log(ip, "Speedtest: waiting for CIRCUIT CONNECTED…", console=True)
+        with state_lock:
+            speedtest_status[ip] = "WAIT CIRCUIT"
+        deadline = time.time() + 600
+        while time.time() < deadline:
+            time.sleep(15)
+            with state_lock:
+                circuit = device_info.get(ip, {}).get('circuit', '')
+            if circuit == 'CONNECTED':
+                break
+        if circuit != 'CONNECTED':
+            log(ip, "Speedtest: CIRCUIT not CONNECTED after 10 minutes — skipping", console=True)
+            with state_lock:
+                speedtest_status[ip] = "SKIPPED"
+            save_status()
+            return
+
+    device_index = m.group(1)
+    src_color = SPEEDTEST_SRC_COLOR.get(device_index)
+    if not src_color:
+        log(ip, f"Speedtest: no color mapping for R{device_index} — skipping", console=True)
+        with state_lock:
+            speedtest_status[ip] = "SKIPPED"
+        save_status()
+        return
+
+    with state_lock:
+        speedtest_status[ip] = "RUNNING"
+
+    log(ip, f"Speedtest: starting  src={ip} color={src_color}  dst={SPEEDTEST_DST_IP} color={SPEEDTEST_DST_COLOR}", console=True)
+
+    try:
+        # Get source UUID
+        src_uuid = _vmanage_get_device_uuid(ip)
+        if not src_uuid:
+            raise ValueError(f"UUID not found for {ip}")
+
+        # Enable data stream
+        vmanage_session.post(
+            f"{VMANAGE_BASE_URL}/dataservice/settings/configuration/vmanagedatastream",
+            json={"enable": True, "ipType": "systemIp", "serverHostName": "systemIp", "vpn": "0"},
+            timeout=15,
+        )
+
+        # Start speedtest session
+        resp = vmanage_session.post(
+            f"{VMANAGE_BASE_URL}/dataservice/stream/device/speed",
+            json={
+                "deviceUUID":       src_uuid,
+                "sourceIp":         ip,
+                "sourceColor":      src_color,
+                "destinationIp":    SPEEDTEST_DST_IP,
+                "destinationColor": SPEEDTEST_DST_COLOR,
+                "port":             "80",
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        session_id = resp.json()["sessionId"]
+        log(ip, f"Speedtest: session {session_id}")
+
+        # Kick off
+        vmanage_session.get(
+            f"{VMANAGE_BASE_URL}/dataservice/stream/device/speed/start/{session_id}",
+            timeout=15,
+        ).raise_for_status()
+
+        # Poll until completed or timeout
+        deadline = time.time() + 300
+        while time.time() < deadline:
+            time.sleep(5)
+            r = vmanage_session.get(
+                f"{VMANAGE_BASE_URL}/dataservice/stream/device/speed/{session_id}",
+                params={"logId": 2}, timeout=15,
+            )
+            if not r.ok:
+                continue
+            try:
+                body = r.json()
+                if isinstance(body, dict) and "status" in body:
+                    status = body["status"]
+                elif isinstance(body, dict) and "data" in body:
+                    entries = body.get("data", [])
+                    status = entries[-1].get("status", "progress") if entries else "progress"
+                else:
+                    status = "progress"
+            except Exception:
+                status = "progress"
+            if status in ("completed", "complete", "done"):
+                break
+
+        # Clean up session
+        vmanage_session.get(
+            f"{VMANAGE_BASE_URL}/dataservice/stream/device/speed/disable/{session_id}",
+            timeout=15,
+        )
+
+        # Fetch results
+        time.sleep(3)
+        r = vmanage_session.post(
+            f"{VMANAGE_BASE_URL}/dataservice/statistics/speedtest",
+            json={
+                "query": {
+                    "condition": "AND",
+                    "rules": [
+                        {"value": [ip],          "field": "source_local_ip", "type": "string", "operator": "in"},
+                        {"value": ["completed"], "field": "status",           "type": "string", "operator": "in"},
+                    ],
+                },
+                "fields": ["entry_time", "down_speed", "up_speed", "source_circuit", "destination_circuit", "session_id"],
+                "size": 5,
+                "sort": [{"field": "entry_time", "type": "date", "order": "desc"}],
+            },
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json().get("data", [])
+        if not data:
+            raise ValueError("no completed result found in statistics")
+
+        result = data[0]
+        dl = result.get("down_speed", 0)
+        ul = result.get("up_speed", 0)
+        label = f"↓{dl:.1f} ↑{ul:.1f} Mbps"
+        log(ip, f"Speedtest: {label}  circuit={result.get('source_circuit')}→{result.get('destination_circuit')}", console=True)
+        with state_lock:
+            speedtest_status[ip] = label
+
+    except Exception as exc:
+        log(ip, f"Speedtest FAILED: {exc}", console=True)
+        with state_lock:
+            speedtest_status[ip] = "FAILED"
+
+    save_status()
+
+
 def _vmanage_build_variable_list(ip: str, target_group: str, uuid: str, csv_row: dict) -> list[dict]:
     """
     Build [{name, value}] for PUT /v1/config-group/{id}/device/variables.
@@ -839,6 +1006,9 @@ def move_to_final_config_group(ip: str) -> None:
         log(ip, f"vManage: deploy submitted (HTTP {resp.status_code})", console=True)
         with state_lock:
             vmanage_status[ip] = "DEPLOYED"
+            speedtest_status[ip] = "PENDING"
+
+        threading.Thread(target=run_speedtest, args=(ip,), daemon=True).start()
 
     except requests.HTTPError as exc:
         body = exc.response.text[:500] if exc.response is not None else ""
@@ -1261,13 +1431,13 @@ def info_collector_loop(ips: list[str]) -> None:
             time.sleep(remaining)
 
 
-_DASH_WIDTH = 170
+_DASH_WIDTH = 192
 
 def print_status(display_order: list[str], now: float) -> None:
     with print_lock:
         print("\033[2J\033[H", end="")  # clear screen, cursor to top
         print(f"{'─'*_DASH_WIDTH}")
-        print(f"  {'IP':<20}  {'HOSTNAME':<14}  {'CODE STATUS':<34}  {'CONFIG':<10}  {'POLICY':<10}  {'CIRCUIT':<28}  {'SWITCHPORTS':<40}")
+        print(f"  {'IP':<20}  {'HOSTNAME':<14}  {'CODE STATUS':<34}  {'CONFIG':<10}  {'SPEED':<20}  {'POLICY':<10}  {'CIRCUIT':<28}  {'SWITCHPORTS':<40}")
         print(f"{'─'*_DASH_WIDTH}")
         for entry in display_order:
             if entry.startswith("#"):
@@ -1315,7 +1485,8 @@ def print_status(display_order: list[str], now: float) -> None:
                 else:
                     circuit = info.get('circuit', '')
                 switchports = info.get('switchports', '')
-            print(f"  {ip:<20}  {hostnames.get(ip, ''):<14}  {state:<34}  {cfg:<10}  {policy:<10}  {circuit:<28}  {switchports:<40}")
+                speed = speedtest_status.get(ip, '')
+            print(f"  {ip:<20}  {hostnames.get(ip, ''):<14}  {state:<34}  {cfg:<10}  {speed:<20}  {policy:<10}  {circuit:<28}  {switchports:<40}")
         print(f"{'─'*_DASH_WIDTH}  [{ts()}]")
 
         # vManage task summary (live from vManage API)
@@ -1389,11 +1560,23 @@ def main() -> None:
         pending_moves = [
             ip for ip in ips
             if completed.get(ip) == "UPGRADE COMPLETE"
-            and vmanage_status.get(ip) not in ("MOVED", "SKIPPED")
+            and vmanage_status.get(ip) not in ("DEPLOYED", "SKIPPED")
         ]
     for ip in pending_moves:
         log(ip, "Resuming vManage config group move from previous run", console=True)
         threading.Thread(target=move_to_final_config_group, args=(ip,), daemon=True).start()
+
+    # Resume any speedtests that didn't complete in a previous run
+    with state_lock:
+        pending_speedtests = [
+            ip for ip in ips
+            if vmanage_status.get(ip) == "DEPLOYED"
+            and speedtest_status.get(ip) in ("PENDING", "RUNNING", None)
+            and ip not in {p for p in pending_moves}
+        ]
+    for ip in pending_speedtests:
+        log(ip, "Resuming speedtest from previous run", console=True)
+        threading.Thread(target=run_speedtest, args=(ip,), daemon=True).start()
 
     print(f"Found {len(ips)} target IP(s):\n  " + "\n  ".join(ips))
     print(f"\nMonitoring — upgrade triggers after {UP_THRESHOLD}s continuous uptime\n")

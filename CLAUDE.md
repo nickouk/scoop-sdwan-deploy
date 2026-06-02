@@ -2,6 +2,19 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## API Reference
+
+**Cisco Catalyst WAN SDK**: https://github.com/cisco-open/cisco-catalyst-wan-sdk
+
+This open-source Python SDK is the authoritative reference for constructing vManage REST API calls. When an API endpoint or request format is unclear, consult the SDK source — particularly:
+- `catalystwan/api/speedtest_api.py` — speedtest flow (`/dataservice/stream/device/speed`)
+- `catalystwan/api/basic_api.py` — device state methods (BFD colors, data stream enable)
+- `catalystwan/api/` — other API wrappers organised by feature area
+
+The SDK uses `catalystwan.session` for authenticated requests; the equivalent in our scripts is the `requests.Session` with JSESSIONID cookie + `X-XSRF-TOKEN` header.
+
+---
+
 ## Deployment Pipeline
 
 This repository is **Step 2** of a broader SD-WAN deployment pipeline for migrating sites to a Cisco IOS-XE SD-WAN solution.
