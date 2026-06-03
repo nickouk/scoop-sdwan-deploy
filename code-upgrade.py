@@ -571,9 +571,20 @@ def run_command(client: paramiko.SSHClient, ip: str, command: str,
         client = ssh_connect(ip)
 
     log(ip, f"CMD: {command}")
-    _, stdout, stderr = client.exec_command(command, timeout=timeout)
-    output = stdout.read().decode(errors="replace")
-    err    = stderr.read().decode(errors="replace")
+    try:
+        _, stdout, stderr = client.exec_command(command, timeout=timeout)
+        output = stdout.read().decode(errors="replace")
+        err    = stderr.read().decode(errors="replace")
+    except EOFError:
+        log(ip, "SSH channel EOF — reconnecting and retrying")
+        try:
+            client.close()
+        except Exception:
+            pass
+        client = ssh_connect(ip)
+        _, stdout, stderr = client.exec_command(command, timeout=timeout)
+        output = stdout.read().decode(errors="replace")
+        err    = stderr.read().decode(errors="replace")
     if err.strip():
         log(ip, f"STDERR: {err.strip()}")
     return client, output
@@ -644,6 +655,23 @@ def _vmanage_get_device_uuid(ip: str) -> str | None:
     except Exception as exc:
         log(ip, f"vManage get-device-uuid error: {exc}")
     return None
+
+
+def _vmanage_get_bfd_colors(ip: str) -> list[str]:
+    """Return the list of BFD TLOC colors active on this device, e.g. ['green'] or ['blue']."""
+    if not vmanage_session:
+        return []
+    try:
+        resp = vmanage_session.get(
+            f"{VMANAGE_BASE_URL}/dataservice/device/bfd/state/device/tlocInterfaceMap",
+            params={"deviceId": ip},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return list(resp.json().get("intfList", {}).keys())
+    except Exception as exc:
+        log(ip, f"vManage get-bfd-colors error: {exc}")
+    return []
 
 
 def _wait_for_vmanage_idle(ip: str, timeout: int = 600, poll: int = 15) -> bool:
@@ -919,9 +947,15 @@ def run_speedtest(ip: str) -> None:
             return
 
         device_index = m.group(1)
-        src_color = SPEEDTEST_SRC_COLOR.get(device_index)
+        bfd_colors = _vmanage_get_bfd_colors(ip)
+        if bfd_colors:
+            src_color = bfd_colors[0]
+            log(ip, f"Speedtest: BFD colors for {hostname}: {bfd_colors} — using {src_color!r}")
+        else:
+            src_color = SPEEDTEST_SRC_COLOR.get(device_index)
+            log(ip, f"Speedtest: BFD color lookup failed — falling back to hardcoded {src_color!r}")
         if not src_color:
-            log(ip, f"Speedtest: no color mapping for R{device_index} — skipping", console=True)
+            log(ip, f"Speedtest: no color available for R{device_index} — skipping", console=True)
             with state_lock:
                 speedtest_status[ip] = "SKIPPED"
             save_status()
@@ -996,6 +1030,8 @@ def _run_speedtest(ip: str, src_color: str) -> None:
             },
             timeout=30,
         )
+        if not resp.ok:
+            log(ip, f"Speedtest: POST /stream/device/speed HTTP {resp.status_code}: {resp.text[:400]}")
         resp.raise_for_status()
         session_id = resp.json()["sessionId"]
         log(ip, f"Speedtest: session {session_id}")
@@ -1313,42 +1349,71 @@ def move_to_final_config_group(ip: str) -> None:
         # ── Step 7: Poll task to completion ───────────────────────────────────
         action_id = None
         try:
-            action_id = resp.json().get("id")
+            body = resp.json()
+            action_id = body.get("id") or body.get("actionId") or body.get("taskId")
+            if not action_id:
+                log(ip, f"vManage: config deploy response body: {body}")
         except Exception:
             pass
 
-        if action_id:
-            log(ip, f"vManage: config deploy task {action_id} — polling for completion", console=True)
-            deadline = time.time() + 1800
-            while time.time() < deadline:
-                time.sleep(15)
-                try:
-                    r = vmanage_session.get(
-                        f"{VMANAGE_BASE_URL}/dataservice/device/action/status/{action_id}",
-                        timeout=15,
-                    )
-                    if not r.ok:
-                        log(ip, f"vManage: config task poll HTTP {r.status_code} — retrying")
-                        continue
-                    body = r.json()
-                    summary_status = body.get("summary", {}).get("status", "")
-                    log(ip, f"vManage: config task {action_id} status={summary_status!r}")
-                    if summary_status.lower() == "done":
-                        device_results = body.get("data", [])
-                        failures = [d for d in device_results if d.get("status", "").lower() == "failure"]
-                        if failures:
-                            raise ValueError(f"config deploy task reported failure: {failures[0].get('activity', failures[0])}")
-                        break
-                    elif summary_status.lower() in ("error", "failed"):
-                        raise ValueError(f"config deploy task failed with status: {summary_status!r}")
-                except ValueError:
-                    raise
-                except Exception as exc:
-                    log(ip, f"vManage: config task poll error: {exc}")
-            else:
-                raise ValueError("config deploy task did not complete within 30 minutes")
+        if not action_id:
+            raise ValueError("config deploy returned no action ID — cannot confirm task completed")
+
+        log(ip, f"vManage: config deploy task {action_id} — polling for completion", console=True)
+        deadline = time.time() + 1800
+        while time.time() < deadline:
+            time.sleep(15)
+            try:
+                r = vmanage_session.get(
+                    f"{VMANAGE_BASE_URL}/dataservice/device/action/status/{action_id}",
+                    timeout=15,
+                )
+                if not r.ok:
+                    log(ip, f"vManage: config task poll HTTP {r.status_code} — retrying")
+                    continue
+                body = r.json()
+                summary_status = body.get("summary", {}).get("status", "")
+                log(ip, f"vManage: config task {action_id} status={summary_status!r}")
+                if summary_status.lower() == "done":
+                    device_results = body.get("data", [])
+                    failures = [d for d in device_results if d.get("status", "").lower() == "failure"]
+                    if failures:
+                        raise ValueError(f"config deploy task reported failure: {failures[0].get('activity', failures[0])}")
+                    break
+                elif summary_status.lower() in ("error", "failed"):
+                    raise ValueError(f"config deploy task failed with status: {summary_status!r}")
+            except ValueError:
+                raise
+            except Exception as exc:
+                log(ip, f"vManage: config task poll error: {exc}")
         else:
-            log(ip, "vManage: config deploy response had no action ID — cannot poll task", console=True)
+            raise ValueError("config deploy task did not complete within 30 minutes")
+
+        # Verify the device actually received the config (task "done" doesn't guarantee
+        # the push reached the device if it lost connectivity to vManage mid-deploy)
+        log(ip, "vManage: config task done — verifying via SSH that device is on final config group", console=True)
+        verify_deadline = time.time() + 300
+        config_verified = False
+        while time.time() < verify_deadline:
+            time.sleep(30)
+            try:
+                ssh_client = ssh_connect(ip)
+                ssh_client, ssh_out = run_command(ssh_client, ip, "show sdwan system", timeout=SSH_TIMEOUT)
+                ssh_client.close()
+                for line in ssh_out.splitlines():
+                    if any(k in line.lower() for k in ('configuration template', 'config-template', 'config template')):
+                        parts = [p.strip() for p in re.split(r':\s*|\s{2,}', line.strip()) if p.strip()]
+                        val = parts[-1].lower() if len(parts) >= 2 else ''
+                        if val.startswith('type'):
+                            config_verified = True
+                        break
+            except Exception as exc:
+                log(ip, f"vManage: SSH config verify error: {exc}")
+            if config_verified:
+                break
+            log(ip, "vManage: device still on onboard config — waiting for push to arrive…")
+        if not config_verified:
+            raise ValueError("config deploy task completed but device still on onboard config after 5 minutes — device likely lost connectivity to vManage during push")
 
         with state_lock:
             vmanage_status[ip] = "DEPLOYED"
@@ -1750,15 +1815,35 @@ def _collect_one(ip: str) -> None:
             log(ip, f"Info collect SSH error: {type(exc).__name__}: {exc}")
             return
 
-    # If the circuit just became CONNECTED but speedtest thread died in WAIT CIRCUIT, kick it
+    # If script thinks DEPLOYED but SSH shows device is still on onboard config,
+    # reset so move_to_final_config_group re-runs (device lost connectivity during push)
+    with state_lock:
+        ssh_config   = device_info.get(ip, {}).get('config', '?')
+        vm_status    = vmanage_status.get(ip)
+        upgrade_done = completed.get(ip) == "UPGRADE COMPLETE"
+        config_mismatch = (vm_status == "DEPLOYED"
+                           and ssh_config == "REQUIRED"
+                           and upgrade_done)
+    if config_mismatch:
+        log(ip, "Config mismatch: script says DEPLOYED but device still on onboard config — re-queuing config deploy", console=True)
+        with state_lock:
+            vmanage_status[ip]  = None
+            speedtest_status[ip] = None
+        save_status()
+        threading.Thread(target=move_to_final_config_group, args=(ip,), daemon=True).start()
+        return
+
+    # Kick speedtest if it's stuck (WAIT CIRCUIT with circuit now up) or previously failed
     with state_lock:
         circuit  = device_info.get(ip, {}).get('circuit', '')
-        stuck    = (speedtest_status.get(ip) == "WAIT CIRCUIT"
+        spd      = speedtest_status.get(ip)
+        kickable = (spd in ("WAIT CIRCUIT", "FAILED")
                     and vmanage_status.get(ip) == "DEPLOYED"
                     and ip not in _speedtest_running
                     and circuit.startswith('CONNECTED'))
-    if stuck:
-        log(ip, "Speedtest thread was stuck in WAIT CIRCUIT — circuit now CONNECTED, re-spawning", console=True)
+    if kickable:
+        reason = "stuck in WAIT CIRCUIT — circuit now CONNECTED" if spd == "WAIT CIRCUIT" else "previous speedtest failed"
+        log(ip, f"Speedtest {reason} — re-spawning", console=True)
         threading.Thread(target=run_speedtest, args=(ip,), daemon=True).start()
 
 
