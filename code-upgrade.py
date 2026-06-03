@@ -63,6 +63,31 @@ VMANAGE_COL_MAP = {
     "Rollback Timer (sec)":    "pseudo_commit_timer",
 }
 
+WEBEX_CONFIG_FILE = os.path.join(_SCRIPT_DIR, "webex.json")
+
+
+# ── Webex (populated at startup from webex.json) ──────────────────────────────
+webex_bot_token = ""
+webex_room_id   = ""
+
+
+def webex_notify(message: str) -> None:
+    """Send a Markdown message to the configured Webex room. Silently no-ops if unconfigured."""
+    if not webex_bot_token or not webex_room_id:
+        return
+    try:
+        resp = requests.post(
+            "https://webexapis.com/v1/messages",
+            headers={"Authorization": f"Bearer {webex_bot_token}"},
+            json={"roomId": webex_room_id, "markdown": message},
+            timeout=10,
+            verify=True,
+        )
+        if not resp.ok:
+            log("Webex", f"notification failed HTTP {resp.status_code}: {resp.text[:200]}")
+    except Exception as exc:
+        log("Webex", f"notification failed: {exc}")
+
 
 # ── Credentials (populated at startup) ────────────────────────────────────────
 local_user      = ""
@@ -97,6 +122,7 @@ policy_status:        dict[str, str]  = {}   # ip -> policy group deploy status
 speedtest_status:     dict[str, str]  = {}   # ip -> speedtest result or status label
 ready_for_switch:     dict[str, str]  = {}    # site-key -> hostname of first device that passed speedtest
 _speedtest_sem        = threading.Semaphore(1)  # only one speedtest at a time
+_speedtest_running:   set[str]        = set()  # IPs with an active speedtest thread
 csv_vars:             dict[str, dict]  = {}   # system-ip -> full variable row from CSV
 vmanage_tasks:        list[dict]      = []   # active tasks polled from vManage API
 vmanage_tasks_lock    = threading.Lock()
@@ -301,6 +327,23 @@ def log(ip: str, msg: str, console: bool = False) -> None:
         if _log_file:
             _log_file.write(line + "\n")
             _log_file.flush()
+
+
+def load_webex_config() -> None:
+    global webex_bot_token, webex_room_id
+    try:
+        with open(WEBEX_CONFIG_FILE) as f:
+            cfg = json.load(f)
+        webex_bot_token = cfg.get("bot_token", "").strip()
+        webex_room_id   = cfg.get("room_id", "").strip()
+        if webex_bot_token and webex_room_id:
+            print(f"Webex notifications enabled (room {webex_room_id[:8]}…)")
+        else:
+            print("Webex: config found but bot_token/room_id missing — notifications disabled")
+    except FileNotFoundError:
+        print(f"Webex: {WEBEX_CONFIG_FILE} not found — notifications disabled")
+    except Exception as exc:
+        print(f"Webex: failed to load config — {exc} — notifications disabled")
 
 
 def prompt_credentials() -> None:
@@ -655,8 +698,8 @@ def _try_trigger_policy_for_site(trigger_ip: str) -> None:
     Check if all conditions are met to deploy the policy group for this site:
       - Every router at the site has vmanage_status == "DEPLOYED" (CONFIG complete)
       - At least one router at the site has a completed speedtest (↓XX ↑XX Mbps)
-    If conditions are met, atomically claims any un-started IPs and spawns
-    deploy_policy_group threads for them.
+    If conditions are met, atomically claims all site IPs and spawns ONE
+    deploy_policy_group_for_site thread covering the whole site.
     """
     with state_lock:
         hostname = hostnames.get(trigger_ip, "")
@@ -684,92 +727,106 @@ def _try_trigger_policy_for_site(trigger_ip: str) -> None:
             log(trigger_ip, "Policy trigger: waiting — no speedtest complete for site yet")
             return
 
-        needs_policy = [
-            ip for ip in site_ips
-            if policy_status.get(ip) not in (
+        # If any IP at this site is already claimed or done, skip entirely
+        if any(
+            policy_status.get(ip) in (
                 "WAITING", "ASSOCIATING", "SETTING VARS", "DEPLOYING", "DEPLOYED", "FAILED"
             )
-        ]
-        for ip in needs_policy:
+            for ip in site_ips
+        ):
+            return
+
+        # Atomically claim all IPs for this site before releasing the lock
+        for ip in site_ips:
             policy_status[ip] = "WAITING"
 
-    for ip in needs_policy:
-        log(ip, f"Triggering policy group deployment (site {site_key})", console=True)
-        threading.Thread(target=deploy_policy_group, args=(ip,), daemon=True).start()
+    log(trigger_ip, f"Triggering policy group deployment for site {site_key} ({len(site_ips)} device(s))", console=True)
+    threading.Thread(target=deploy_policy_group_for_site, args=(site_ips,), daemon=True).start()
 
 
-def deploy_policy_group(ip: str) -> None:
-    """Associate and deploy the policy group for this device. Runs in its own thread."""
-    if not vmanage_session:
-        log(ip, "vManage: no session — skipping policy group deploy", console=True)
+def deploy_policy_group_for_site(site_ips: list[str]) -> None:
+    """
+    Associate and deploy the policy group for all devices at a site in a single
+    vManage task, avoiding transaction conflicts from concurrent per-device tasks.
+    """
+    log_ip   = site_ips[0]
+    site_key = re.sub(r'-R\d+$', '', hostnames.get(log_ip, log_ip))
+
+    def set_all(status: str) -> None:
         with state_lock:
-            policy_status[ip] = "SKIPPED"
+            for ip in site_ips:
+                policy_status[ip] = status
+
+    if not vmanage_session:
+        log(log_ip, "vManage: no session — skipping policy group deploy", console=True)
+        set_all("SKIPPED")
         save_status()
         return
 
-    if not _wait_for_vmanage_idle(ip):
-        log(ip, "vManage: timed out waiting for tasks to clear before policy deploy", console=True)
-        with state_lock:
-            policy_status[ip] = "FAILED"
+    if not _wait_for_vmanage_idle(log_ip):
+        log(log_ip, "vManage: timed out waiting for tasks to clear before policy deploy", console=True)
+        set_all("FAILED")
         save_status()
         return
 
     try:
-        uuid = _vmanage_get_device_uuid(ip)
-        if not uuid:
-            raise ValueError(f"device UUID not found for system-ip {ip}")
+        # Resolve UUID and variable list for every device in the site
+        devices_info: list[tuple[str, str, list]] = []
+        for ip in site_ips:
+            uuid = _vmanage_get_device_uuid(ip)
+            if not uuid:
+                raise ValueError(f"device UUID not found for system-ip {ip}")
+            csv_row = csv_vars.get(ip)
+            if not csv_row:
+                raise ValueError(f"no CSV variables found for system-ip {ip}")
+            var_list = _vmanage_build_variable_list(ip, VMANAGE_POLICY_GROUP_UUID, uuid, csv_row,
+                                                    group_type="policy-group")
+            devices_info.append((ip, uuid, var_list))
 
-        csv_row = csv_vars.get(ip)
-        if not csv_row:
-            raise ValueError(f"no CSV variables found for system-ip {ip}")
-
-        # ── Step 1: Associate with policy group ───────────────────────────────
-        with state_lock:
-            policy_status[ip] = "ASSOCIATING"
-        log(ip, "vManage: associating with policy group", console=True)
+        # ── Step 1: Associate all devices in one call ─────────────────────────
+        set_all("ASSOCIATING")
+        log(log_ip, f"vManage: associating {len(devices_info)} device(s) with policy group", console=True)
         resp = vmanage_session.post(
             f"{VMANAGE_BASE_URL}/dataservice/v1/policy-group/{VMANAGE_POLICY_GROUP_UUID}/device/associate",
-            json={"devices": [{"id": uuid}]},
+            json={"devices": [{"id": uuid} for _, uuid, _ in devices_info]},
             timeout=60,
         )
         if not resp.ok:
-            log(ip, f"vManage: policy associate HTTP {resp.status_code} — {resp.text[:500]!r}", console=True)
+            log(log_ip, f"vManage: policy associate HTTP {resp.status_code} — {resp.text[:500]!r}", console=True)
         resp.raise_for_status()
-        log(ip, f"vManage: policy associate successful (HTTP {resp.status_code})", console=True)
+        log(log_ip, f"vManage: policy associate successful (HTTP {resp.status_code})", console=True)
 
         # ── Step 2: Wait after associate ──────────────────────────────────────
-        with state_lock:
-            policy_status[ip] = "WAITING"
-        if not _wait_for_vmanage_idle(ip):
+        set_all("WAITING")
+        if not _wait_for_vmanage_idle(log_ip):
             raise ValueError("timed out waiting after policy associate")
 
-        # ── Step 3: Set variables ─────────────────────────────────────────────
-        with state_lock:
-            policy_status[ip] = "SETTING VARS"
-        log(ip, "vManage: setting policy group variables", console=True)
-        var_list = _vmanage_build_variable_list(ip, VMANAGE_POLICY_GROUP_UUID, uuid, csv_row,
-                                                group_type="policy-group")
+        # ── Step 3: Set variables for all devices in one call ─────────────────
+        set_all("SETTING VARS")
+        log(log_ip, "vManage: setting policy group variables for all devices", console=True)
         resp = vmanage_session.put(
             f"{VMANAGE_BASE_URL}/dataservice/v1/policy-group/{VMANAGE_POLICY_GROUP_UUID}/device/variables",
-            json={"solution": "sdwan", "devices": [{"device-id": uuid, "variables": var_list}]},
+            json={
+                "solution": "sdwan",
+                "devices": [{"device-id": uuid, "variables": var_list} for _, uuid, var_list in devices_info],
+            },
             timeout=60,
         )
         if not resp.ok:
-            log(ip, f"vManage: policy variables HTTP {resp.status_code} — {resp.text[:500]!r}", console=True)
+            log(log_ip, f"vManage: policy variables HTTP {resp.status_code} — {resp.text[:500]!r}", console=True)
         resp.raise_for_status()
-        log(ip, f"vManage: policy variables set (HTTP {resp.status_code})", console=True)
+        log(log_ip, f"vManage: policy variables set (HTTP {resp.status_code})", console=True)
 
-        # ── Step 4: Deploy ────────────────────────────────────────────────────
-        with state_lock:
-            policy_status[ip] = "DEPLOYING"
-        log(ip, "vManage: deploying policy group to device", console=True)
+        # ── Step 4: Deploy all devices in a single task ───────────────────────
+        set_all("DEPLOYING")
+        log(log_ip, f"vManage: deploying policy group to {len(devices_info)} device(s)", console=True)
         resp = vmanage_session.post(
             f"{VMANAGE_BASE_URL}/dataservice/v1/policy-group/{VMANAGE_POLICY_GROUP_UUID}/device/deploy",
-            json={"devices": [{"id": uuid}]},
+            json={"devices": [{"id": uuid} for _, uuid, _ in devices_info]},
             timeout=60,
         )
         if not resp.ok:
-            log(ip, f"vManage: policy deploy HTTP {resp.status_code} — {resp.text[:500]!r}", console=True)
+            log(log_ip, f"vManage: policy deploy HTTP {resp.status_code} — {resp.text[:500]!r}", console=True)
         resp.raise_for_status()
 
         # ── Step 5: Poll task until vManage reports completion ─────────────────
@@ -780,8 +837,8 @@ def deploy_policy_group(ip: str) -> None:
             pass
 
         if action_id:
-            log(ip, f"vManage: policy deploy task {action_id} — polling for completion", console=True)
-            deadline = time.time() + 1800  # 30 min timeout
+            log(log_ip, f"vManage: policy deploy task {action_id} — polling for completion", console=True)
+            deadline = time.time() + 1800
             while time.time() < deadline:
                 time.sleep(15)
                 try:
@@ -790,12 +847,12 @@ def deploy_policy_group(ip: str) -> None:
                         timeout=15,
                     )
                     if not r.ok:
-                        log(ip, f"vManage: policy task poll HTTP {r.status_code} — retrying")
+                        log(log_ip, f"vManage: policy task poll HTTP {r.status_code} — retrying")
                         continue
                     body = r.json()
                     summary_status = body.get("summary", {}).get("status", "")
-                    log(ip, f"vManage: policy task {action_id} status={summary_status!r}")
-                    if summary_status.lower() in ("done",):
+                    log(log_ip, f"vManage: policy task {action_id} status={summary_status!r}")
+                    if summary_status.lower() == "done":
                         device_results = body.get("data", [])
                         failures = [d for d in device_results if d.get("status", "").lower() == "failure"]
                         if failures:
@@ -806,24 +863,24 @@ def deploy_policy_group(ip: str) -> None:
                 except ValueError:
                     raise
                 except Exception as exc:
-                    log(ip, f"vManage: policy task poll error: {exc}")
+                    log(log_ip, f"vManage: policy task poll error: {exc}")
             else:
                 raise ValueError("policy deploy task did not complete within 30 minutes")
         else:
-            log(ip, "vManage: policy deploy response had no action ID — cannot poll task", console=True)
+            log(log_ip, "vManage: policy deploy response had no action ID — cannot poll task", console=True)
 
-        with state_lock:
-            policy_status[ip] = "DEPLOYED"
+        set_all("DEPLOYED")
+        log(log_ip, f"vManage: policy group DEPLOYED for site {site_key}", console=True)
 
     except requests.HTTPError as exc:
         body = exc.response.text[:500] if exc.response is not None else ""
-        log(ip, f"vManage: policy deploy FAILED: {exc}  body={body!r}", console=True)
-        with state_lock:
-            policy_status[ip] = "FAILED"
+        log(log_ip, f"vManage: policy deploy FAILED: {exc}  body={body!r}", console=True)
+        webex_notify(f"⚠️ **FAILURE** site {site_key}: policy group deploy failed — {exc}")
+        set_all("FAILED")
     except Exception as exc:
-        log(ip, f"vManage: policy deploy FAILED: {exc}", console=True)
-        with state_lock:
-            policy_status[ip] = "FAILED"
+        log(log_ip, f"vManage: policy deploy FAILED: {exc}", console=True)
+        webex_notify(f"⚠️ **FAILURE** site {site_key}: policy group deploy failed — {exc}")
+        set_all("FAILED")
 
     save_status()
 
@@ -836,63 +893,75 @@ def run_speedtest(ip: str) -> None:
     Phase 2 (inside semaphore):  actual vManage API calls — serialised so only
                                  one test runs at a time.
     """
-    # ── Phase 1: pre-flight (no semaphore — circuit wait can take 30 min) ─────
-    if not vmanage_session:
-        log(ip, "Speedtest: no vManage session — skipping", console=True)
-        with state_lock:
-            speedtest_status[ip] = "SKIPPED"
-        save_status()
-        return
-
-    hostname = hostnames.get(ip, "")
-    m = re.search(r'-R(\d+)$', hostname)
-    if not m:
-        log(ip, f"Speedtest: cannot determine R1/R2 from hostname {hostname!r} — skipping", console=True)
-        with state_lock:
-            speedtest_status[ip] = "SKIPPED"
-        save_status()
-        return
-
-    device_index = m.group(1)
-    src_color = SPEEDTEST_SRC_COLOR.get(device_index)
-    if not src_color:
-        log(ip, f"Speedtest: no color mapping for R{device_index} — skipping", console=True)
-        with state_lock:
-            speedtest_status[ip] = "SKIPPED"
-        save_status()
-        return
-
-    # Wait for CIRCUIT: CONNECTED (outside semaphore so blocked devices don't
-    # prevent other ready devices from running their tests)
+    # ── Duplicate-spawn guard ─────────────────────────────────────────────────
     with state_lock:
-        circuit = device_info.get(ip, {}).get('circuit', '')
-    if not circuit.startswith('CONNECTED'):
-        log(ip, "Speedtest: waiting for CIRCUIT CONNECTED…", console=True)
-        with state_lock:
-            speedtest_status[ip] = "WAIT CIRCUIT"
-        deadline = time.time() + 1800
-        last_logged = ""
-        while True:
-            with state_lock:
-                circuit = device_info.get(ip, {}).get('circuit', '')
-                ip_in_dev_info = ip in device_info
-            if circuit != last_logged:
-                log(ip, f"Speedtest: CIRCUIT check — value={circuit!r}  in_device_info={ip_in_dev_info}", console=True)
-                last_logged = circuit
-            if circuit.startswith('CONNECTED'):
-                log(ip, "Speedtest: CIRCUIT now CONNECTED — proceeding", console=True)
-                break
-            if time.time() >= deadline:
-                log(ip, "Speedtest: CIRCUIT not CONNECTED after 30 minutes — skipping", console=True)
-                with state_lock:
-                    speedtest_status[ip] = "SKIPPED"
-                save_status()
-                return
-            time.sleep(10)
+        if ip in _speedtest_running:
+            log(ip, "Speedtest: thread already running — skipping duplicate spawn")
+            return
+        _speedtest_running.add(ip)
 
-    # ── Phase 2: run the test (serialised) ────────────────────────────────────
-    with _speedtest_sem:
-        _run_speedtest(ip, src_color)
+    try:
+        # ── Phase 1: pre-flight (no semaphore — circuit wait can take 30 min) ─
+        if not vmanage_session:
+            log(ip, "Speedtest: no vManage session — skipping", console=True)
+            with state_lock:
+                speedtest_status[ip] = "SKIPPED"
+            save_status()
+            return
+
+        hostname = hostnames.get(ip, "")
+        m = re.search(r'-R(\d+)$', hostname)
+        if not m:
+            log(ip, f"Speedtest: cannot determine R1/R2 from hostname {hostname!r} — skipping", console=True)
+            with state_lock:
+                speedtest_status[ip] = "SKIPPED"
+            save_status()
+            return
+
+        device_index = m.group(1)
+        src_color = SPEEDTEST_SRC_COLOR.get(device_index)
+        if not src_color:
+            log(ip, f"Speedtest: no color mapping for R{device_index} — skipping", console=True)
+            with state_lock:
+                speedtest_status[ip] = "SKIPPED"
+            save_status()
+            return
+
+        # Wait for CIRCUIT: CONNECTED (outside semaphore so blocked devices don't
+        # prevent other ready devices from running their tests)
+        with state_lock:
+            circuit = device_info.get(ip, {}).get('circuit', '')
+        if not circuit.startswith('CONNECTED'):
+            log(ip, "Speedtest: waiting for CIRCUIT CONNECTED…", console=True)
+            with state_lock:
+                speedtest_status[ip] = "WAIT CIRCUIT"
+            deadline = time.time() + 1800
+            last_logged = ""
+            while True:
+                with state_lock:
+                    circuit = device_info.get(ip, {}).get('circuit', '')
+                    ip_in_dev_info = ip in device_info
+                if circuit != last_logged:
+                    log(ip, f"Speedtest: CIRCUIT check — value={circuit!r}  in_device_info={ip_in_dev_info}", console=True)
+                    last_logged = circuit
+                if circuit.startswith('CONNECTED'):
+                    log(ip, "Speedtest: CIRCUIT now CONNECTED — proceeding", console=True)
+                    break
+                if time.time() >= deadline:
+                    log(ip, "Speedtest: CIRCUIT not CONNECTED after 30 minutes — skipping", console=True)
+                    with state_lock:
+                        speedtest_status[ip] = "SKIPPED"
+                    save_status()
+                    return
+                time.sleep(10)
+
+        # ── Phase 2: run the test (serialised) ────────────────────────────────
+        with _speedtest_sem:
+            _run_speedtest(ip, src_color)
+
+    finally:
+        with state_lock:
+            _speedtest_running.discard(ip)
 
 
 def _run_speedtest(ip: str, src_color: str) -> None:
@@ -999,14 +1068,18 @@ def _run_speedtest(ip: str, src_color: str) -> None:
         site_key = re.sub(r'-R\d+$', '', hostname)  # e.g. SC-3-0079
         with state_lock:
             speedtest_status[ip] = label
-            if site_key not in ready_for_switch:
+            upgrade_ok = completed.get(ip) == "UPGRADE COMPLETE"
+            config_ok  = vmanage_status.get(ip) == "DEPLOYED"
+            if upgrade_ok and config_ok and site_key not in ready_for_switch:
                 ready_for_switch[site_key] = hostname
                 log(ip, f"{hostname} is READY for SWITCH", console=True)
+                webex_notify(f"✅ **{hostname}** is READY for SWITCH")
 
         _try_trigger_policy_for_site(ip)
 
     except Exception as exc:
         log(ip, f"Speedtest FAILED: {exc}", console=True)
+        webex_notify(f"⚠️ **FAILURE** {hostnames.get(ip, ip)} (`{ip}`): speedtest failed — {exc}")
         with state_lock:
             speedtest_status[ip] = "FAILED"
 
@@ -1101,7 +1174,12 @@ def move_to_final_config_group(ip: str) -> None:
         return
 
     if config_status == 'COMPLETE':
-        log(ip, "vManage: skipping config group move — device already on final config group", console=True)
+        log(ip, "vManage: CONFIG already COMPLETE — marking DEPLOYED and resuming pipeline", console=True)
+        with state_lock:
+            vmanage_status[ip] = "DEPLOYED"
+        save_status()
+        threading.Thread(target=run_speedtest, args=(ip,), daemon=True).start()
+        _try_trigger_policy_for_site(ip)
         return
 
     if config_status == '?':
@@ -1231,6 +1309,47 @@ def move_to_final_config_group(ip: str) -> None:
             log(ip, f"vManage: deploy HTTP {resp.status_code} — body: {resp.text[:500]!r}", console=True)
         resp.raise_for_status()
         log(ip, f"vManage: deploy submitted (HTTP {resp.status_code})", console=True)
+
+        # ── Step 7: Poll task to completion ───────────────────────────────────
+        action_id = None
+        try:
+            action_id = resp.json().get("id")
+        except Exception:
+            pass
+
+        if action_id:
+            log(ip, f"vManage: config deploy task {action_id} — polling for completion", console=True)
+            deadline = time.time() + 1800
+            while time.time() < deadline:
+                time.sleep(15)
+                try:
+                    r = vmanage_session.get(
+                        f"{VMANAGE_BASE_URL}/dataservice/device/action/status/{action_id}",
+                        timeout=15,
+                    )
+                    if not r.ok:
+                        log(ip, f"vManage: config task poll HTTP {r.status_code} — retrying")
+                        continue
+                    body = r.json()
+                    summary_status = body.get("summary", {}).get("status", "")
+                    log(ip, f"vManage: config task {action_id} status={summary_status!r}")
+                    if summary_status.lower() == "done":
+                        device_results = body.get("data", [])
+                        failures = [d for d in device_results if d.get("status", "").lower() == "failure"]
+                        if failures:
+                            raise ValueError(f"config deploy task reported failure: {failures[0].get('activity', failures[0])}")
+                        break
+                    elif summary_status.lower() in ("error", "failed"):
+                        raise ValueError(f"config deploy task failed with status: {summary_status!r}")
+                except ValueError:
+                    raise
+                except Exception as exc:
+                    log(ip, f"vManage: config task poll error: {exc}")
+            else:
+                raise ValueError("config deploy task did not complete within 30 minutes")
+        else:
+            log(ip, "vManage: config deploy response had no action ID — cannot poll task", console=True)
+
         with state_lock:
             vmanage_status[ip] = "DEPLOYED"
             speedtest_status[ip] = "PENDING"
@@ -1241,12 +1360,14 @@ def move_to_final_config_group(ip: str) -> None:
     except requests.HTTPError as exc:
         body = exc.response.text[:500] if exc.response is not None else ""
         log(ip, f"vManage: config group deploy FAILED: {exc}  body={body!r}", console=True)
+        webex_notify(f"⚠️ **FAILURE** {hostnames.get(ip, ip)} (`{ip}`): config group deploy failed — {exc}")
         with state_lock:
             vmanage_status[ip] = "FAILED"
         if disassociated:
             _vmanage_rollback_to_onboard(ip, uuid)
     except Exception as exc:
         log(ip, f"vManage: config group deploy FAILED: {exc}", console=True)
+        webex_notify(f"⚠️ **FAILURE** {hostnames.get(ip, ip)} (`{ip}`): config group deploy failed — {exc}")
         with state_lock:
             vmanage_status[ip] = "FAILED"
         if disassociated:
@@ -1326,6 +1447,8 @@ def upgrade_device(ip: str) -> None:
 
     def fail(reason: str) -> None:
         log(ip, f"FAILED: {reason} — queuing for retry in 5 minutes", console=True)
+        hostname = hostnames.get(ip, ip)
+        webex_notify(f"⚠️ **FAILURE** {hostname} (`{ip}`): upgrade failed — {reason}")
         with state_lock:
             checking.discard(ip)
             checking_since.pop(ip, None)
@@ -1625,6 +1748,18 @@ def _collect_one(ip: str) -> None:
             client.close()
         except Exception as exc:
             log(ip, f"Info collect SSH error: {type(exc).__name__}: {exc}")
+            return
+
+    # If the circuit just became CONNECTED but speedtest thread died in WAIT CIRCUIT, kick it
+    with state_lock:
+        circuit  = device_info.get(ip, {}).get('circuit', '')
+        stuck    = (speedtest_status.get(ip) == "WAIT CIRCUIT"
+                    and vmanage_status.get(ip) == "DEPLOYED"
+                    and ip not in _speedtest_running
+                    and circuit.startswith('CONNECTED'))
+    if stuck:
+        log(ip, "Speedtest thread was stuck in WAIT CIRCUIT — circuit now CONNECTED, re-spawning", console=True)
+        threading.Thread(target=run_speedtest, args=(ip,), daemon=True).start()
 
 
 def info_collector_loop(ips: list[str]) -> None:
@@ -1774,6 +1909,7 @@ def main() -> None:
     print(f"Logging to: {log_path}")
     print(f"Status file: {STATUS_FILE}\n")
 
+    load_webex_config()
     prompt_credentials()
 
     if not vmanage_login():
@@ -1791,6 +1927,8 @@ def main() -> None:
     for ip in ips:
         ping_results[ip] = "Down"
     load_status(ips)
+
+    webex_notify(f"🚀 SD-WAN deployment pipeline started — monitoring **{len(ips)}** device(s)")
 
     # Resume any config group moves that didn't complete in a previous run
     with state_lock:
