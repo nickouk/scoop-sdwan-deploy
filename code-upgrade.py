@@ -15,6 +15,7 @@ import subprocess
 import sys
 from datetime import datetime
 
+import socket
 import paramiko
 import requests
 import urllib3
@@ -575,8 +576,8 @@ def run_command(client: paramiko.SSHClient, ip: str, command: str,
         _, stdout, stderr = client.exec_command(command, timeout=timeout)
         output = stdout.read().decode(errors="replace")
         err    = stderr.read().decode(errors="replace")
-    except EOFError:
-        log(ip, "SSH channel EOF — reconnecting and retrying")
+    except (EOFError, socket.timeout, TimeoutError) as exc:
+        log(ip, f"SSH channel {type(exc).__name__} — reconnecting and retrying")
         try:
             client.close()
         except Exception:
@@ -1231,7 +1232,12 @@ def move_to_final_config_group(ip: str) -> None:
         if config_status == '?':
             log(ip, "vManage: CONFIG still unknown after 3 minutes — proceeding anyway (device is on onboarding group post-upgrade)", console=True)
         elif config_status == 'COMPLETE':
-            log(ip, "vManage: CONFIG is now COMPLETE — device already on final group, skipping move", console=True)
+            log(ip, "vManage: CONFIG now COMPLETE — marking DEPLOYED and resuming pipeline", console=True)
+            with state_lock:
+                vmanage_status[ip] = "DEPLOYED"
+            save_status()
+            threading.Thread(target=run_speedtest, args=(ip,), daemon=True).start()
+            _try_trigger_policy_for_site(ip)
             return
 
     if not vmanage_session:
@@ -1356,42 +1362,43 @@ def move_to_final_config_group(ip: str) -> None:
         except Exception:
             pass
 
-        if not action_id:
-            raise ValueError("config deploy returned no action ID — cannot confirm task completed")
-
-        log(ip, f"vManage: config deploy task {action_id} — polling for completion", console=True)
-        deadline = time.time() + 1800
-        while time.time() < deadline:
-            time.sleep(15)
-            try:
-                r = vmanage_session.get(
-                    f"{VMANAGE_BASE_URL}/dataservice/device/action/status/{action_id}",
-                    timeout=15,
-                )
-                if not r.ok:
-                    log(ip, f"vManage: config task poll HTTP {r.status_code} — retrying")
-                    continue
-                body = r.json()
-                summary_status = body.get("summary", {}).get("status", "")
-                log(ip, f"vManage: config task {action_id} status={summary_status!r}")
-                if summary_status.lower() == "done":
-                    device_results = body.get("data", [])
-                    failures = [d for d in device_results if d.get("status", "").lower() == "failure"]
-                    if failures:
-                        raise ValueError(f"config deploy task reported failure: {failures[0].get('activity', failures[0])}")
-                    break
-                elif summary_status.lower() in ("error", "failed"):
-                    raise ValueError(f"config deploy task failed with status: {summary_status!r}")
-            except ValueError:
-                raise
-            except Exception as exc:
-                log(ip, f"vManage: config task poll error: {exc}")
+        if action_id:
+            log(ip, f"vManage: config deploy task {action_id} — polling for completion", console=True)
+            deadline = time.time() + 1800
+            while time.time() < deadline:
+                time.sleep(15)
+                try:
+                    r = vmanage_session.get(
+                        f"{VMANAGE_BASE_URL}/dataservice/device/action/status/{action_id}",
+                        timeout=15,
+                    )
+                    if not r.ok:
+                        log(ip, f"vManage: config task poll HTTP {r.status_code} — retrying")
+                        continue
+                    body = r.json()
+                    summary_status = body.get("summary", {}).get("status", "")
+                    log(ip, f"vManage: config task {action_id} status={summary_status!r}")
+                    if summary_status.lower() == "done":
+                        device_results = body.get("data", [])
+                        failures = [d for d in device_results if d.get("status", "").lower() == "failure"]
+                        if failures:
+                            raise ValueError(f"config deploy task reported failure: {failures[0].get('activity', failures[0])}")
+                        break
+                    elif summary_status.lower() in ("error", "failed"):
+                        raise ValueError(f"config deploy task failed with status: {summary_status!r}")
+                except ValueError:
+                    raise
+                except Exception as exc:
+                    log(ip, f"vManage: config task poll error: {exc}")
+            else:
+                raise ValueError("config deploy task did not complete within 30 minutes")
         else:
-            raise ValueError("config deploy task did not complete within 30 minutes")
+            log(ip, "vManage: config deploy returned no action ID — skipping task poll, verifying via SSH", console=True)
 
-        # Verify the device actually received the config (task "done" doesn't guarantee
-        # the push reached the device if it lost connectivity to vManage mid-deploy)
-        log(ip, "vManage: config task done — verifying via SSH that device is on final config group", console=True)
+        # Verify the device actually received the config via SSH — required whether or not
+        # we had a task ID to poll (task "done" doesn't guarantee push reached the device
+        # if it lost connectivity to vManage mid-deploy)
+        log(ip, "vManage: verifying config applied via SSH…", console=True)
         verify_deadline = time.time() + 300
         config_verified = False
         while time.time() < verify_deadline:
@@ -1805,32 +1812,48 @@ def _collect_one(ip: str) -> None:
         with state_lock:
             if ping_results.get(ip, "Down") == "Down":
                 return
-        try:
-            client = ssh_connect(ip)
-            if ip not in hostnames:
-                client = discover_hostname(client, ip)
-            collect_device_info(client, ip)
-            client.close()
-        except Exception as exc:
-            log(ip, f"Info collect SSH error: {type(exc).__name__}: {exc}")
+        last_exc = None
+        for attempt in range(3):
+            try:
+                if attempt:
+                    time.sleep(15)
+                client = ssh_connect(ip)
+                if ip not in hostnames:
+                    client = discover_hostname(client, ip)
+                collect_device_info(client, ip)
+                client.close()
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                log(ip, f"Info collect SSH error (attempt {attempt + 1}/3): {type(exc).__name__}: {exc}")
+        if last_exc:
             return
 
-    # If script thinks DEPLOYED but SSH shows device is still on onboard config,
-    # reset so move_to_final_config_group re-runs (device lost connectivity during push)
     with state_lock:
         ssh_config   = device_info.get(ip, {}).get('config', '?')
         vm_status    = vmanage_status.get(ip)
         upgrade_done = completed.get(ip) == "UPGRADE COMPLETE"
-        config_mismatch = (vm_status == "DEPLOYED"
-                           and ssh_config == "REQUIRED"
-                           and upgrade_done)
-    if config_mismatch:
+
+    # Script says DEPLOYED but device is still on onboard config — re-queue the deploy
+    if vm_status == "DEPLOYED" and ssh_config == "REQUIRED" and upgrade_done:
         log(ip, "Config mismatch: script says DEPLOYED but device still on onboard config — re-queuing config deploy", console=True)
         with state_lock:
-            vmanage_status[ip]  = None
+            vmanage_status[ip]   = None
             speedtest_status[ip] = None
         save_status()
         threading.Thread(target=move_to_final_config_group, args=(ip,), daemon=True).start()
+        return
+
+    # Deploy was marked FAILED (or never ran) but SSH confirms device is already on final config group
+    if vm_status in ("FAILED", None) and ssh_config == "COMPLETE" and upgrade_done:
+        log(ip, "Config deploy was marked FAILED but SSH confirms device is on final config — recovering pipeline", console=True)
+        with state_lock:
+            vmanage_status[ip]   = "DEPLOYED"
+            speedtest_status[ip] = "PENDING"
+        save_status()
+        threading.Thread(target=run_speedtest, args=(ip,), daemon=True).start()
+        _try_trigger_policy_for_site(ip)
         return
 
     # Kick speedtest if it's stuck (WAIT CIRCUIT with circuit now up) or previously failed
