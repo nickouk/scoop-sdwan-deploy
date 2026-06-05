@@ -124,6 +124,9 @@ speedtest_status:     dict[str, str]  = {}   # ip -> speedtest result or status 
 ready_for_switch:     dict[str, str]  = {}    # site-key -> hostname of first device that passed speedtest
 _speedtest_sem        = threading.Semaphore(1)  # only one speedtest at a time
 _speedtest_running:   set[str]        = set()  # IPs with an active speedtest thread
+_speedtest_session:   dict[str, str]  = {}     # ip -> last known vManage session_id
+_speedtest_retry_after: dict[str, float] = {}  # ip -> earliest epoch to retry after TBST1008
+_site_complete_notified: set[str]     = set()  # site-keys where completion alert was sent
 csv_vars:             dict[str, dict]  = {}   # system-ip -> full variable row from CSV
 vmanage_tasks:        list[dict]      = []   # active tasks polled from vManage API
 vmanage_tasks_lock    = threading.Lock()
@@ -900,6 +903,7 @@ def deploy_policy_group_for_site(site_ips: list[str]) -> None:
 
         set_all("DEPLOYED")
         log(log_ip, f"vManage: policy group DEPLOYED for site {site_key}", console=True)
+        webex_notify(f"✅ **{site_key}**: policy group DEPLOYED")
 
     except requests.HTTPError as exc:
         body = exc.response.text[:500] if exc.response is not None else ""
@@ -1006,6 +1010,21 @@ def _run_speedtest(ip: str, src_color: str) -> None:
     log(ip, f"Speedtest: starting  src={ip} color={src_color}  dst={SPEEDTEST_DST_IP} color={SPEEDTEST_DST_COLOR}", console=True)
 
     try:
+        # Disable any previous session for this device (handles orphaned sessions
+        # left over from script restarts or failed cleanup)
+        with state_lock:
+            prev_session = _speedtest_session.pop(ip, None)
+        if prev_session:
+            log(ip, f"Speedtest: disabling previous session {prev_session} before starting")
+            try:
+                vmanage_session.get(
+                    f"{VMANAGE_BASE_URL}/dataservice/stream/device/speed/disable/{prev_session}",
+                    timeout=15,
+                )
+                time.sleep(3)
+            except Exception as exc:
+                log(ip, f"Speedtest: could not disable previous session: {exc}")
+
         # Get source UUID
         src_uuid = _vmanage_get_device_uuid(ip)
         if not src_uuid:
@@ -1033,8 +1052,21 @@ def _run_speedtest(ip: str, src_color: str) -> None:
         )
         if not resp.ok:
             log(ip, f"Speedtest: POST /stream/device/speed HTTP {resp.status_code}: {resp.text[:400]}")
+            # TBST1008 = another session is still active on vManage (e.g. orphaned from a
+            # script restart). We don't have the session_id, so set a backoff and let
+            # the session expire naturally on vManage before retrying.
+            try:
+                err_code = resp.json().get("error", {}).get("code", "")
+            except Exception:
+                err_code = ""
+            if err_code == "TBST1008":
+                with state_lock:
+                    _speedtest_retry_after[ip] = time.time() + 300
+                log(ip, "Speedtest: TBST1008 — orphaned session active, backing off 5 minutes", console=True)
         resp.raise_for_status()
         session_id = resp.json()["sessionId"]
+        with state_lock:
+            _speedtest_session[ip] = session_id
         log(ip, f"Speedtest: session {session_id}")
 
         # Kick off
@@ -1045,6 +1077,7 @@ def _run_speedtest(ip: str, src_color: str) -> None:
 
         # Poll until completed or timeout
         deadline = time.time() + 300
+        last_status = "unknown"
         while time.time() < deadline:
             time.sleep(5)
             r = vmanage_session.get(
@@ -1052,6 +1085,7 @@ def _run_speedtest(ip: str, src_color: str) -> None:
                 params={"logId": 2}, timeout=15,
             )
             if not r.ok:
+                log(ip, f"Speedtest: poll HTTP {r.status_code} — {r.text[:200]}")
                 continue
             try:
                 body = r.json()
@@ -1062,18 +1096,28 @@ def _run_speedtest(ip: str, src_color: str) -> None:
                     status = entries[-1].get("status", "progress") if entries else "progress"
                 else:
                     status = "progress"
-            except Exception:
+                    log(ip, f"Speedtest: poll unexpected body shape: {str(body)[:200]}")
+            except Exception as exc:
                 status = "progress"
+                log(ip, f"Speedtest: poll parse error: {exc}")
+            if status != last_status:
+                log(ip, f"Speedtest: poll status={status!r}")
+                last_status = status
             if status in ("completed", "complete", "done"):
                 break
+        else:
+            log(ip, f"Speedtest: poll timed out after 300s — last status={last_status!r}")
 
         # Clean up session
         vmanage_session.get(
             f"{VMANAGE_BASE_URL}/dataservice/stream/device/speed/disable/{session_id}",
             timeout=15,
         )
+        with state_lock:
+            _speedtest_session.pop(ip, None)
 
-        # Fetch results
+        # Fetch results — filter by session_id (more reliable than source_local_ip
+        # which may differ from the system-ip used to initiate the test)
         time.sleep(3)
         r = vmanage_session.post(
             f"{VMANAGE_BASE_URL}/dataservice/statistics/speedtest",
@@ -1081,8 +1125,8 @@ def _run_speedtest(ip: str, src_color: str) -> None:
                 "query": {
                     "condition": "AND",
                     "rules": [
-                        {"value": [ip],          "field": "source_local_ip", "type": "string", "operator": "in"},
-                        {"value": ["completed"], "field": "status",           "type": "string", "operator": "in"},
+                        {"value": [session_id], "field": "session_id", "type": "string", "operator": "in"},
+                        {"value": ["completed"], "field": "status",    "type": "string", "operator": "in"},
                     ],
                 },
                 "fields": ["entry_time", "down_speed", "up_speed", "source_circuit", "destination_circuit", "session_id"],
@@ -1094,7 +1138,29 @@ def _run_speedtest(ip: str, src_color: str) -> None:
         r.raise_for_status()
         data = r.json().get("data", [])
         if not data:
-            raise ValueError("no completed result found in statistics")
+            log(ip, f"Speedtest: no result by session_id — raw response: {r.text[:400]}")
+            # Fallback: query by source IP (catches older vManage versions where session_id isn't indexed)
+            r2 = vmanage_session.post(
+                f"{VMANAGE_BASE_URL}/dataservice/statistics/speedtest",
+                json={
+                    "query": {
+                        "condition": "AND",
+                        "rules": [
+                            {"value": [ip],          "field": "source_local_ip", "type": "string", "operator": "in"},
+                            {"value": ["completed"], "field": "status",           "type": "string", "operator": "in"},
+                        ],
+                    },
+                    "fields": ["entry_time", "down_speed", "up_speed", "source_circuit", "destination_circuit", "session_id"],
+                    "size": 5,
+                    "sort": [{"field": "entry_time", "type": "date", "order": "desc"}],
+                },
+                timeout=15,
+            )
+            r2.raise_for_status()
+            data = r2.json().get("data", [])
+            if not data:
+                log(ip, f"Speedtest: no result by source_local_ip either — raw: {r2.text[:400]}")
+                raise ValueError("no completed result found in statistics")
 
         result = data[0]
         dl = result.get("down_speed", 0)
@@ -1103,6 +1169,7 @@ def _run_speedtest(ip: str, src_color: str) -> None:
         log(ip, f"Speedtest: {label}  circuit={result.get('source_circuit')}→{result.get('destination_circuit')}", console=True)
         hostname = hostnames.get(ip, ip)
         site_key = re.sub(r'-R\d+$', '', hostname)  # e.g. SC-3-0079
+        webex_notify(f"📊 **{hostname}** (`{ip}`): speedtest {label}")
         with state_lock:
             speedtest_status[ip] = label
             upgrade_ok = completed.get(ip) == "UPGRADE COMPLETE"
@@ -1110,7 +1177,7 @@ def _run_speedtest(ip: str, src_color: str) -> None:
             if upgrade_ok and config_ok and site_key not in ready_for_switch:
                 ready_for_switch[site_key] = hostname
                 log(ip, f"{hostname} is READY for SWITCH", console=True)
-                webex_notify(f"✅ **{hostname}** is READY for SWITCH")
+                webex_notify(f"✅ **{hostname}** is READY for SWITCH — {label}")
 
         _try_trigger_policy_for_site(ip)
 
@@ -1215,6 +1282,7 @@ def move_to_final_config_group(ip: str) -> None:
         with state_lock:
             vmanage_status[ip] = "DEPLOYED"
         save_status()
+        webex_notify(f"✅ **{hostnames.get(ip, ip)}** (`{ip}`): config group DEPLOYED")
         threading.Thread(target=run_speedtest, args=(ip,), daemon=True).start()
         _try_trigger_policy_for_site(ip)
         return
@@ -1236,6 +1304,7 @@ def move_to_final_config_group(ip: str) -> None:
             with state_lock:
                 vmanage_status[ip] = "DEPLOYED"
             save_status()
+            webex_notify(f"✅ **{hostnames.get(ip, ip)}** (`{ip}`): config group DEPLOYED")
             threading.Thread(target=run_speedtest, args=(ip,), daemon=True).start()
             _try_trigger_policy_for_site(ip)
             return
@@ -1425,7 +1494,7 @@ def move_to_final_config_group(ip: str) -> None:
         with state_lock:
             vmanage_status[ip] = "DEPLOYED"
             speedtest_status[ip] = "PENDING"
-
+        webex_notify(f"✅ **{hostnames.get(ip, ip)}** (`{ip}`): config group DEPLOYED")
         threading.Thread(target=run_speedtest, args=(ip,), daemon=True).start()
         _try_trigger_policy_for_site(ip)
 
@@ -1579,6 +1648,7 @@ def upgrade_device(ip: str) -> None:
             bin_missing.discard(ip)
             file_copying.discard(ip)
         save_status()
+        webex_notify(f"📡 **{hostnames.get(ip, ip)}** (`{ip}`): online — pipeline starting")
 
         if is_active and not is_default:
             # Active but set-default / remove not yet done — jump to step 7
@@ -1726,6 +1796,7 @@ def upgrade_device(ip: str) -> None:
 
         # ── Done ──────────────────────────────────────────────────────────────
         log(ip, f"=== UPGRADE COMPLETE — {TARGET_VERSION} active+default ===", console=True)
+        webex_notify(f"✅ **{hostnames.get(ip, ip)}** (`{ip}`): code upgrade complete — {TARGET_VERSION}")
         with state_lock:
             completed[ip] = "UPGRADE COMPLETE"
             in_progress.discard(ip)
@@ -1858,16 +1929,46 @@ def _collect_one(ip: str) -> None:
 
     # Kick speedtest if it's stuck (WAIT CIRCUIT with circuit now up) or previously failed
     with state_lock:
-        circuit  = device_info.get(ip, {}).get('circuit', '')
-        spd      = speedtest_status.get(ip)
+        circuit     = device_info.get(ip, {}).get('circuit', '')
+        spd         = speedtest_status.get(ip)
+        retry_after = _speedtest_retry_after.get(ip, 0)
         kickable = (spd in ("WAIT CIRCUIT", "FAILED")
                     and vmanage_status.get(ip) == "DEPLOYED"
                     and ip not in _speedtest_running
-                    and circuit.startswith('CONNECTED'))
+                    and circuit.startswith('CONNECTED')
+                    and time.time() >= retry_after)
     if kickable:
         reason = "stuck in WAIT CIRCUIT — circuit now CONNECTED" if spd == "WAIT CIRCUIT" else "previous speedtest failed"
         log(ip, f"Speedtest {reason} — re-spawning", console=True)
         threading.Thread(target=run_speedtest, args=(ip,), daemon=True).start()
+
+    # Site completion: Dialer1 connected, only G0/1/0 live (provisioning + temp ports down),
+    # all pipeline stages done (policy DEPLOYED for every router at the site).
+    with state_lock:
+        hostname_now = hostnames.get(ip, '')
+        info_now     = device_info.get(ip, {})
+    if hostname_now:
+        sw   = info_now.get('switchports', '')
+        circ = info_now.get('circuit', '')
+        if ('G0/1/0 UP' in sw
+                and 'PROVISIONING' not in sw
+                and 'TEMP PORTS IN USE' not in sw
+                and circ.startswith('CONNECTED')):
+            site_key = re.sub(r'-R\d+$', '', hostname_now)
+            with state_lock:
+                site_ips   = [sip for sip, hn in hostnames.items()
+                              if re.sub(r'-R\d+$', '', hn) == site_key]
+                all_done   = (bool(site_ips)
+                              and all(policy_status.get(sip) == 'DEPLOYED' for sip in site_ips)
+                              and site_key not in _site_complete_notified)
+            if all_done:
+                with state_lock:
+                    _site_complete_notified.add(site_key)
+                log(ip, f"Site {site_key} COMPLETE — G0/1/0 live, {circ}, policy deployed for all routers", console=True)
+                webex_notify(
+                    f"🎉 **{site_key} COMPLETE** — {hostname_now}: G0/1/0 UP, {circ}, "
+                    f"no provisioning/temp ports, policy deployed for all routers"
+                )
 
 
 def info_collector_loop(ips: list[str]) -> None:
