@@ -751,12 +751,13 @@ def _try_trigger_policy_for_site(trigger_ip: str) -> None:
                 log(trigger_ip, f"Policy trigger: waiting — {ip} CONFIG not yet DEPLOYED ({vmanage_status.get(ip, 'N/A')})")
                 return
 
-        speedtest_done = any(
+        speedtest_done = all(
             str(speedtest_status.get(ip, '')).startswith('↓')
             for ip in site_ips
         )
         if not speedtest_done:
-            log(trigger_ip, "Policy trigger: waiting — no speedtest complete for site yet")
+            pending = [ip for ip in site_ips if not str(speedtest_status.get(ip, '')).startswith('↓')]
+            log(trigger_ip, f"Policy trigger: waiting — speedtest not yet complete for {[hostnames.get(ip, ip) for ip in pending]}")
             return
 
         # Skip if a deploy is already in-flight for this site
