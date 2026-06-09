@@ -759,13 +759,15 @@ def _try_trigger_policy_for_site(trigger_ip: str) -> None:
             log(trigger_ip, "Policy trigger: waiting — no speedtest complete for site yet")
             return
 
-        # If any IP at this site is already claimed or done, skip entirely
+        # Skip if a deploy is already in-flight for this site
         if any(
-            policy_status.get(ip) in (
-                "WAITING", "ASSOCIATING", "SETTING VARS", "DEPLOYING", "DEPLOYED", "FAILED"
-            )
+            policy_status.get(ip) in ("WAITING", "ASSOCIATING", "SETTING VARS", "DEPLOYING")
             for ip in site_ips
         ):
+            return
+
+        # Skip if every known device is already deployed (nothing new to add)
+        if all(policy_status.get(ip) == "DEPLOYED" for ip in site_ips):
             return
 
         # Atomically claim all IPs for this site before releasing the lock
