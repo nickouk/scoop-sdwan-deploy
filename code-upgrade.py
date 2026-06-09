@@ -864,7 +864,10 @@ def deploy_policy_group_for_site(site_ips: list[str]) -> None:
         # ── Step 5: Poll task until vManage reports completion ─────────────────
         action_id = None
         try:
-            action_id = resp.json().get("id")
+            body = resp.json()
+            action_id = body.get("id") or body.get("actionId") or body.get("taskId")
+            if not action_id:
+                log(log_ip, f"vManage: policy deploy response body (no action ID): {body}")
         except Exception:
             pass
 
@@ -899,7 +902,10 @@ def deploy_policy_group_for_site(site_ips: list[str]) -> None:
             else:
                 raise ValueError("policy deploy task did not complete within 30 minutes")
         else:
-            log(log_ip, "vManage: policy deploy response had no action ID — cannot poll task", console=True)
+            log(log_ip, "vManage: policy deploy had no action ID — waiting for vManage tasks to clear", console=True)
+            set_all("DEPLOYING")
+            if not _wait_for_vmanage_idle(log_ip, timeout=1800):
+                raise ValueError("policy deploy task did not complete within 30 minutes")
 
         set_all("DEPLOYED")
         log(log_ip, f"vManage: policy group DEPLOYED for site {site_key}", console=True)
@@ -1920,10 +1926,13 @@ def _collect_one(ip: str) -> None:
     if vm_status in ("FAILED", None) and ssh_config == "COMPLETE" and upgrade_done:
         log(ip, "Config deploy was marked FAILED but SSH confirms device is on final config — recovering pipeline", console=True)
         with state_lock:
-            vmanage_status[ip]   = "DEPLOYED"
-            speedtest_status[ip] = "PENDING"
+            vmanage_status[ip] = "DEPLOYED"
+            existing_spd = speedtest_status.get(ip, "")
+            if not str(existing_spd).startswith("↓"):
+                speedtest_status[ip] = "PENDING"
         save_status()
-        threading.Thread(target=run_speedtest, args=(ip,), daemon=True).start()
+        if not str(existing_spd).startswith("↓"):
+            threading.Thread(target=run_speedtest, args=(ip,), daemon=True).start()
         _try_trigger_policy_for_site(ip)
         return
 
