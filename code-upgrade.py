@@ -230,6 +230,10 @@ def load_status(ips: list[str]) -> None:
                 device_info[ip] = saved_info
             vm_st = entry.get("vmanage_status")
             if vm_st:
+                # Reset transient mid-deploy states — _collect_one will recover
+                if vm_st in ("ASSOCIATING", "SETTING VARS", "DEPLOYING", "WAITING") or vm_st.startswith("WAITING ("):
+                    vm_st = None
+            if vm_st:
                 vmanage_status[ip] = vm_st
             pol_st = entry.get("policy_status")
             if pol_st:
