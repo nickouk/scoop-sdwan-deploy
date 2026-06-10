@@ -991,7 +991,6 @@ def run_speedtest(ip: str) -> None:
             log(ip, "Speedtest: waiting for CIRCUIT CONNECTED…", console=True)
             with state_lock:
                 speedtest_status[ip] = "WAIT CIRCUIT"
-            deadline = time.time() + 1800
             last_logged = ""
             while True:
                 with state_lock:
@@ -1003,12 +1002,6 @@ def run_speedtest(ip: str) -> None:
                 if circuit.startswith('CONNECTED'):
                     log(ip, "Speedtest: CIRCUIT now CONNECTED — proceeding", console=True)
                     break
-                if time.time() >= deadline:
-                    log(ip, "Speedtest: CIRCUIT not CONNECTED after 30 minutes — skipping", console=True)
-                    with state_lock:
-                        speedtest_status[ip] = "SKIPPED"
-                    save_status()
-                    return
                 time.sleep(10)
 
         # ── Phase 2: run the test (serialised) ────────────────────────────────
@@ -2008,13 +2001,15 @@ def _collect_one(ip: str) -> None:
         circuit     = device_info.get(ip, {}).get('circuit', '')
         spd         = speedtest_status.get(ip)
         retry_after = _speedtest_retry_after.get(ip, 0)
-        kickable = (spd in ("WAIT CIRCUIT", "FAILED")
+        kickable = (spd in ("WAIT CIRCUIT", "FAILED", "SKIPPED")
                     and vmanage_status.get(ip) == "DEPLOYED"
                     and ip not in _speedtest_running
                     and circuit.startswith('CONNECTED')
                     and time.time() >= retry_after)
     if kickable:
-        reason = "stuck in WAIT CIRCUIT — circuit now CONNECTED" if spd == "WAIT CIRCUIT" else "previous speedtest failed"
+        reason = ("stuck in WAIT CIRCUIT — circuit now CONNECTED" if spd == "WAIT CIRCUIT"
+                  else "previously skipped — circuit now CONNECTED" if spd == "SKIPPED"
+                  else "previous speedtest failed")
         log(ip, f"Speedtest {reason} — re-spawning", console=True)
         threading.Thread(target=run_speedtest, args=(ip,), daemon=True).start()
 
