@@ -127,6 +127,7 @@ _speedtest_running:   set[str]        = set()  # IPs with an active speedtest th
 _speedtest_session:   dict[str, str]  = {}     # ip -> last known vManage session_id
 _speedtest_retry_after: dict[str, float] = {}  # ip -> earliest epoch to retry after TBST1008
 _site_complete_notified: set[str]     = set()  # site-keys where completion alert was sent
+_bin_missing_notify_after: dict[str, float] = {}  # ip -> earliest epoch for next bin-missing Webex alert
 csv_vars:             dict[str, dict]  = {}   # system-ip -> full variable row from CSV
 vmanage_tasks:        list[dict]      = []   # active tasks polled from vManage API
 vmanage_tasks_lock    = threading.Lock()
@@ -1595,10 +1596,11 @@ def upgrade_device(ip: str) -> None:
     """Full upgrade workflow for a single device."""
     log(ip, "=== Starting upgrade workflow ===")
 
-    def fail(reason: str) -> None:
+    def fail(reason: str, suppress_webex: bool = False) -> None:
         log(ip, f"FAILED: {reason} — queuing for retry in 5 minutes", console=True)
-        hostname = hostnames.get(ip, ip)
-        webex_notify(f"⚠️ **FAILURE** {hostname} (`{ip}`): upgrade failed — {reason}")
+        if not suppress_webex:
+            hostname = hostnames.get(ip, ip)
+            webex_notify(f"⚠️ **FAILURE** {hostname} (`{ip}`): upgrade failed — {reason}")
         with state_lock:
             checking.discard(ip)
             checking_since.pop(ip, None)
@@ -1657,7 +1659,8 @@ def upgrade_device(ip: str) -> None:
             bin_missing.discard(ip)
             file_copying.discard(ip)
         save_status()
-        webex_notify(f"📡 **{hostnames.get(ip, ip)}** (`{ip}`): online — pipeline starting")
+        if time.time() >= _bin_missing_notify_after.get(ip, 0):
+            webex_notify(f"📡 **{hostnames.get(ip, ip)}** (`{ip}`): online — pipeline starting")
 
         if is_active and not is_default:
             # Active but set-default / remove not yet done — jump to step 7
@@ -1711,7 +1714,12 @@ def upgrade_device(ip: str) -> None:
                     client.close()
                     with state_lock:
                         bin_missing.add(ip)
-                    fail(f"Install file not found and {TARGET_VERSION} not installed: {INSTALL_FILE}")
+                    now = time.time()
+                    suppress = now < _bin_missing_notify_after.get(ip, 0)
+                    if not suppress:
+                        _bin_missing_notify_after[ip] = now + 900  # mute for 15 min after each alert
+                    fail(f"Install file not found and {TARGET_VERSION} not installed: {INSTALL_FILE}",
+                         suppress_webex=suppress)
                     return
                 log(ip, f"{TARGET_VERSION} present — bin consumed by prior run, skipping to activate")
             else:
