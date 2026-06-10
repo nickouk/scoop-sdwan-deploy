@@ -31,6 +31,8 @@ EXPECTED_FILE_SIZE = 734355992    # bytes; c1100-universalk9.17.15.04c.SPA.bin
 UP_THRESHOLD    = 30          # seconds device must be Up before upgrade starts
 PING_INTERVAL   = 5           # seconds between pings
 RETRY_DELAY     = 300         # seconds before retrying a failed device (5 min)
+# Labels that mean the device is on the target version and ready for the config/speedtest pipeline
+PIPELINE_READY  = {"UPGRADE COMPLETE", "ALREADY UP TO DATE"}
 SSH_TIMEOUT     = 30          # seconds for SSH connect/read
 CMD_TIMEOUT     = 600         # seconds to wait for long-running commands
 REBOOT_TIMEOUT  = 600         # seconds to wait for device to come back after reboot
@@ -176,6 +178,8 @@ def save_status() -> None:
                 devices[ip]["policy_status"] = policy_status[ip]
             if ip in speedtest_status:
                 devices[ip]["speedtest_status"] = speedtest_status[ip]
+            if ip in _speedtest_session:
+                devices[ip]["speedtest_session"] = _speedtest_session[ip]
 
     data = {"last_updated": now_str, "devices": devices}
     tmp = STATUS_FILE + ".tmp"
@@ -237,6 +241,11 @@ def load_status(ips: list[str]) -> None:
             sp_st = entry.get("speedtest_status")
             if sp_st:
                 speedtest_status[ip] = sp_st
+            sp_sess = entry.get("speedtest_session")
+            if sp_sess and not str(sp_st).startswith('↓'):
+                # Only restore the session if the speedtest didn't complete — a completed
+                # session has already been disabled; we don't want to re-disable it.
+                _speedtest_session[ip] = sp_sess
             msgs.append(f"  {ip:<20}  {hostname:<28}  {label} (skipping)")
 
         elif status == "retry":
@@ -730,7 +739,7 @@ def _try_trigger_policy_for_site(trigger_ip: str) -> None:
     """
     Check if all conditions are met to deploy the policy group for this site:
       - Every router at the site has vmanage_status == "DEPLOYED" (CONFIG complete)
-      - At least one router at the site has a completed speedtest (↓XX ↑XX Mbps)
+      - At least one router at the site has a completed speedtest result (starts with ↓)
     If conditions are met, atomically claims all site IPs and spawns ONE
     deploy_policy_group_for_site thread covering the whole site.
     """
@@ -752,13 +761,12 @@ def _try_trigger_policy_for_site(trigger_ip: str) -> None:
                 log(trigger_ip, f"Policy trigger: waiting — {ip} CONFIG not yet DEPLOYED ({vmanage_status.get(ip, 'N/A')})")
                 return
 
-        speedtest_done = all(
+        speedtest_done = any(
             str(speedtest_status.get(ip, '')).startswith('↓')
             for ip in site_ips
         )
         if not speedtest_done:
-            pending = [ip for ip in site_ips if not str(speedtest_status.get(ip, '')).startswith('↓')]
-            log(trigger_ip, f"Policy trigger: waiting — speedtest not yet complete for {[hostnames.get(ip, ip) for ip in pending]}")
+            log(trigger_ip, f"Policy trigger: waiting — no speedtest complete yet for site {site_key}")
             return
 
         # Skip if a deploy is already in-flight for this site
@@ -962,13 +970,8 @@ def run_speedtest(ip: str) -> None:
             return
 
         device_index = m.group(1)
-        bfd_colors = _vmanage_get_bfd_colors(ip)
-        if bfd_colors:
-            src_color = bfd_colors[0]
-            log(ip, f"Speedtest: BFD colors for {hostname}: {bfd_colors} — using {src_color!r}")
-        else:
-            src_color = SPEEDTEST_SRC_COLOR.get(device_index)
-            log(ip, f"Speedtest: BFD color lookup failed — falling back to hardcoded {src_color!r}")
+        src_color = SPEEDTEST_SRC_COLOR.get(device_index)
+        log(ip, f"Speedtest: {hostname} → color={src_color!r}")
         if not src_color:
             log(ip, f"Speedtest: no color available for R{device_index} — skipping", console=True)
             with state_lock:
@@ -1011,6 +1014,46 @@ def run_speedtest(ip: str) -> None:
     finally:
         with state_lock:
             _speedtest_running.discard(ip)
+
+
+def _kill_orphaned_speedtest_session(ip: str) -> bool:
+    """Query vManage statistics for any recent non-completed speedtest for ip and disable it.
+    Returns True if a session was found and the disable call was made."""
+    try:
+        cutoff_ms = int((time.time() - 7200) * 1000)  # last 2 hours
+        r = vmanage_session.post(
+            f"{VMANAGE_BASE_URL}/dataservice/statistics/speedtest",
+            json={
+                "query": {
+                    "condition": "AND",
+                    "rules": [
+                        {"value": [ip],              "field": "source_local_ip", "type": "string", "operator": "in"},
+                        {"value": [str(cutoff_ms)],  "field": "entry_time",      "type": "date",   "operator": "greater"},
+                    ],
+                },
+                "fields": ["entry_time", "status", "session_id"],
+                "size": 10,
+                "sort": [{"field": "entry_time", "type": "date", "order": "desc"}],
+            },
+            timeout=15,
+        )
+        if r.ok:
+            for record in r.json().get("data", []):
+                sid    = record.get("session_id")
+                status = record.get("status", "")
+                if sid and status not in ("completed", "complete", "done"):
+                    log(ip, f"Speedtest: found orphaned session {sid} (status={status!r}) via statistics — disabling")
+                    d = vmanage_session.get(
+                        f"{VMANAGE_BASE_URL}/dataservice/stream/device/speed/disable/{sid}",
+                        timeout=15,
+                    )
+                    log(ip, f"Speedtest: disable orphaned session HTTP {d.status_code}")
+                    return True
+        else:
+            log(ip, f"Speedtest: statistics query for orphaned session returned HTTP {r.status_code}")
+    except Exception as exc:
+        log(ip, f"Speedtest: could not query/kill orphaned session: {exc}")
+    return False
 
 
 def _run_speedtest(ip: str, src_color: str) -> None:
@@ -1070,9 +1113,18 @@ def _run_speedtest(ip: str, src_color: str) -> None:
             except Exception:
                 err_code = ""
             if err_code == "TBST1008":
-                with state_lock:
-                    _speedtest_retry_after[ip] = time.time() + 300
-                log(ip, "Speedtest: TBST1008 — orphaned session active, backing off 5 minutes", console=True)
+                # Try to find and disable the orphaned session via statistics API
+                # (catches the case where the session ID wasn't persisted across restarts)
+                killed = _kill_orphaned_speedtest_session(ip)
+                if killed:
+                    # Short wait then let the caller retry immediately
+                    with state_lock:
+                        _speedtest_retry_after[ip] = time.time() + 15
+                    log(ip, "Speedtest: TBST1008 — disabled orphaned session, retrying in 15s", console=True)
+                else:
+                    with state_lock:
+                        _speedtest_retry_after[ip] = time.time() + 300
+                    log(ip, "Speedtest: TBST1008 — orphaned session active, backing off 5 minutes", console=True)
         resp.raise_for_status()
         session_id = resp.json()["sessionId"]
         with state_lock:
@@ -1182,7 +1234,7 @@ def _run_speedtest(ip: str, src_color: str) -> None:
         webex_notify(f"📊 **{hostname}** (`{ip}`): speedtest {label}")
         with state_lock:
             speedtest_status[ip] = label
-            upgrade_ok = completed.get(ip) == "UPGRADE COMPLETE"
+            upgrade_ok = completed.get(ip) in PIPELINE_READY
             config_ok  = vmanage_status.get(ip) == "DEPLOYED"
             if upgrade_ok and config_ok and site_key not in ready_for_switch:
                 ready_for_switch[site_key] = hostname
@@ -1279,7 +1331,7 @@ def _vmanage_build_variable_list(ip: str, target_group: str, uuid: str, csv_row:
 def move_to_final_config_group(ip: str) -> None:
     """Move device from onboarding to final config group. Runs in its own thread."""
     with state_lock:
-        upgrade_done   = completed.get(ip) == "UPGRADE COMPLETE"
+        upgrade_done   = completed.get(ip) in PIPELINE_READY
         config_status  = device_info.get(ip, {}).get('config', '?')
         hostname       = hostnames.get(ip, "")
 
@@ -1921,7 +1973,7 @@ def _collect_one(ip: str) -> None:
     with state_lock:
         ssh_config   = device_info.get(ip, {}).get('config', '?')
         vm_status    = vmanage_status.get(ip)
-        upgrade_done = completed.get(ip) == "UPGRADE COMPLETE"
+        upgrade_done = completed.get(ip) in PIPELINE_READY
 
     # Script says DEPLOYED but device is still on onboard config — re-queue the deploy
     if vm_status == "DEPLOYED" and ssh_config == "REQUIRED" and upgrade_done:
@@ -2163,7 +2215,7 @@ def main() -> None:
     with state_lock:
         pending_moves = [
             ip for ip in ips
-            if completed.get(ip) == "UPGRADE COMPLETE"
+            if completed.get(ip) in PIPELINE_READY
             and vmanage_status.get(ip) not in ("DEPLOYED", "SKIPPED")
         ]
     for ip in pending_moves:
