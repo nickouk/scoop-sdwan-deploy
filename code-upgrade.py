@@ -1701,8 +1701,11 @@ def upgrade_device(ip: str) -> None:
                 completed[ip] = "ALREADY UP TO DATE"
                 checking.discard(ip)
                 checking_since.pop(ip, None)
+                needs_config = vmanage_status.get(ip) not in ("DEPLOYED", "SKIPPED")
             save_status()
             client.close()
+            if needs_config:
+                threading.Thread(target=move_to_final_config_group, args=(ip,), daemon=True).start()
             return
 
         # Needs work — transition to in_progress
@@ -1989,8 +1992,8 @@ def _collect_one(ip: str) -> None:
         threading.Thread(target=move_to_final_config_group, args=(ip,), daemon=True).start()
         return
 
-    # Deploy FAILED and device is still on onboard config — retry the deploy
-    if vm_status == "FAILED" and ssh_config == "REQUIRED" and upgrade_done:
+    # Config deploy never ran or FAILED — device still on onboard config, kick it off
+    if vm_status in ("FAILED", None) and ssh_config == "REQUIRED" and upgrade_done:
         log(ip, "Config deploy FAILED and device still on onboard config — re-queuing config deploy", console=True)
         with state_lock:
             vmanage_status[ip] = None
