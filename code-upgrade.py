@@ -1544,6 +1544,13 @@ def move_to_final_config_group(ip: str) -> None:
                         break
             except Exception as exc:
                 log(ip, f"vManage: SSH config verify error: {exc}")
+            # Fallback: accept device_info from _collect_one if direct SSH fails
+            if not config_verified:
+                with state_lock:
+                    collected_config = device_info.get(ip, {}).get('config', '')
+                if collected_config == 'COMPLETE':
+                    log(ip, "vManage: SSH verify failed but info-collector confirms CONFIG: COMPLETE — accepting")
+                    config_verified = True
             if config_verified:
                 break
             log(ip, "vManage: device still on onboard config — waiting for push to arrive…")
@@ -1980,6 +1987,29 @@ def _collect_one(ip: str) -> None:
             speedtest_status[ip] = None
         save_status()
         threading.Thread(target=move_to_final_config_group, args=(ip,), daemon=True).start()
+        return
+
+    # Deploy FAILED and device is still on onboard config — retry the deploy
+    if vm_status == "FAILED" and ssh_config == "REQUIRED" and upgrade_done:
+        log(ip, "Config deploy FAILED and device still on onboard config — re-queuing config deploy", console=True)
+        with state_lock:
+            vmanage_status[ip] = None
+        save_status()
+        threading.Thread(target=move_to_final_config_group, args=(ip,), daemon=True).start()
+        return
+
+    # Deploy in-progress but SSH already confirms final config landed — no need to wait for verify loop
+    if vm_status == "DEPLOYING" and ssh_config == "COMPLETE" and upgrade_done:
+        log(ip, "Config deploy in-progress but SSH confirms final config already applied — marking DEPLOYED", console=True)
+        with state_lock:
+            vmanage_status[ip] = "DEPLOYED"
+            existing_spd = speedtest_status.get(ip, "")
+            if not str(existing_spd).startswith("↓"):
+                speedtest_status[ip] = "PENDING"
+        save_status()
+        if not str(existing_spd).startswith("↓"):
+            threading.Thread(target=run_speedtest, args=(ip,), daemon=True).start()
+        _try_trigger_policy_for_site(ip)
         return
 
     # Deploy was marked FAILED (or never ran) but SSH confirms device is already on final config group
