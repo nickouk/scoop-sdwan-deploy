@@ -128,6 +128,7 @@ _speedtest_sem        = threading.Semaphore(1)  # only one speedtest at a time
 _speedtest_running:   set[str]        = set()  # IPs with an active speedtest thread
 _speedtest_session:   dict[str, str]  = {}     # ip -> last known vManage session_id
 _speedtest_retry_after: dict[str, float] = {}  # ip -> earliest epoch to retry after TBST1008
+_policy_retry_after:  dict[str, float] = {}    # ip -> earliest epoch to retry a failed policy deploy
 _site_complete_notified: set[str]     = set()  # site-keys where completion alert was sent
 _bin_missing_notify_after: dict[str, float] = {}  # ip -> earliest epoch for next bin-missing Webex alert
 csv_vars:             dict[str, dict]  = {}   # system-ip -> full variable row from CSV
@@ -782,6 +783,12 @@ def _try_trigger_policy_for_site(trigger_ip: str) -> None:
             log(trigger_ip, f"Policy trigger: waiting — no speedtest complete yet for site {site_key}")
             return
 
+        # Don't fire while any speedtest is still running — it would race with the deploy
+        running = [ip for ip in site_ips if ip in _speedtest_running]
+        if running:
+            log(trigger_ip, f"Policy trigger: waiting — speedtest still running on {running}")
+            return
+
         # Skip if a deploy is already in-flight for this site
         if any(
             policy_status.get(ip) in ("WAITING", "ASSOCIATING", "SETTING VARS", "DEPLOYING")
@@ -849,9 +856,18 @@ def deploy_policy_group_for_site(site_ips: list[str]) -> None:
             timeout=60,
         )
         if not resp.ok:
-            log(log_ip, f"vManage: policy associate HTTP {resp.status_code} — {resp.text[:500]!r}", console=True)
-        resp.raise_for_status()
-        log(log_ip, f"vManage: policy associate successful (HTTP {resp.status_code})", console=True)
+            try:
+                err_code = resp.json().get("error", {}).get("code", "")
+            except Exception:
+                err_code = ""
+            if resp.status_code == 400 and err_code == "PLGRP0018":
+                # Device(s) already associated with this policy group — fine, proceed to deploy
+                log(log_ip, f"vManage: policy associate — device(s) already in group (PLGRP0018), proceeding to deploy", console=True)
+            else:
+                log(log_ip, f"vManage: policy associate HTTP {resp.status_code} — {resp.text[:500]!r}", console=True)
+                resp.raise_for_status()
+        else:
+            log(log_ip, f"vManage: policy associate successful (HTTP {resp.status_code})", console=True)
 
         # ── Step 2: Wait after associate ──────────────────────────────────────
         set_all("WAITING")
@@ -870,9 +886,9 @@ def deploy_policy_group_for_site(site_ips: list[str]) -> None:
             timeout=60,
         )
         if not resp.ok:
-            log(log_ip, f"vManage: policy variables HTTP {resp.status_code} — {resp.text[:500]!r}", console=True)
-        resp.raise_for_status()
-        log(log_ip, f"vManage: policy variables set (HTTP {resp.status_code})", console=True)
+            log(log_ip, f"vManage: policy variables HTTP {resp.status_code} (non-fatal) — {resp.text[:500]!r}", console=True)
+        else:
+            log(log_ip, f"vManage: policy variables set (HTTP {resp.status_code})", console=True)
 
         # ── Step 4: Deploy all devices in a single task ───────────────────────
         set_all("DEPLOYING")
@@ -941,10 +957,16 @@ def deploy_policy_group_for_site(site_ips: list[str]) -> None:
         log(log_ip, f"vManage: policy deploy FAILED: {exc}  body={body!r}", console=True)
         webex_notify(f"⚠️ **FAILURE** site {site_key}: policy group deploy failed — {exc}")
         set_all("FAILED")
+        with state_lock:
+            for ip in site_ips:
+                _policy_retry_after[ip] = time.time() + 300
     except Exception as exc:
         log(log_ip, f"vManage: policy deploy FAILED: {exc}", console=True)
         webex_notify(f"⚠️ **FAILURE** site {site_key}: policy group deploy failed — {exc}")
         set_all("FAILED")
+        with state_lock:
+            for ip in site_ips:
+                _policy_retry_after[ip] = time.time() + 300
 
     save_status()
 
@@ -1184,29 +1206,34 @@ def _run_speedtest(ip: str, src_color: str) -> None:
         with state_lock:
             _speedtest_session.pop(ip, None)
 
-        # Fetch results — filter by session_id (more reliable than source_local_ip
-        # which may differ from the system-ip used to initiate the test)
-        time.sleep(3)
-        r = vmanage_session.post(
-            f"{VMANAGE_BASE_URL}/dataservice/statistics/speedtest",
-            json={
-                "query": {
-                    "condition": "AND",
-                    "rules": [
-                        {"value": [session_id], "field": "session_id", "type": "string", "operator": "in"},
-                        {"value": ["completed"], "field": "status",    "type": "string", "operator": "in"},
-                    ],
+        # Fetch results — vManage may take a few seconds to index the result, so
+        # retry with increasing delays before giving up.
+        data = []
+        for attempt, wait in enumerate([5, 10, 15, 30], start=1):
+            time.sleep(wait)
+            log(ip, f"Speedtest: querying statistics (attempt {attempt})")
+            r = vmanage_session.post(
+                f"{VMANAGE_BASE_URL}/dataservice/statistics/speedtest",
+                json={
+                    "query": {
+                        "condition": "AND",
+                        "rules": [
+                            {"value": [session_id], "field": "session_id", "type": "string", "operator": "in"},
+                            {"value": ["completed"], "field": "status",    "type": "string", "operator": "in"},
+                        ],
+                    },
+                    "fields": ["entry_time", "down_speed", "up_speed", "source_circuit", "destination_circuit", "session_id"],
+                    "size": 5,
+                    "sort": [{"field": "entry_time", "type": "date", "order": "desc"}],
                 },
-                "fields": ["entry_time", "down_speed", "up_speed", "source_circuit", "destination_circuit", "session_id"],
-                "size": 5,
-                "sort": [{"field": "entry_time", "type": "date", "order": "desc"}],
-            },
-            timeout=15,
-        )
-        r.raise_for_status()
-        data = r.json().get("data", [])
-        if not data:
-            log(ip, f"Speedtest: no result by session_id — raw response: {r.text[:400]}")
+                timeout=15,
+            )
+            r.raise_for_status()
+            data = r.json().get("data", [])
+            if data:
+                log(ip, f"Speedtest: result found by session_id on attempt {attempt}")
+                break
+            log(ip, f"Speedtest: no result by session_id on attempt {attempt} — raw: {r.text[:400]}")
             # Fallback: query by source IP (catches older vManage versions where session_id isn't indexed)
             r2 = vmanage_session.post(
                 f"{VMANAGE_BASE_URL}/dataservice/statistics/speedtest",
@@ -1226,9 +1253,12 @@ def _run_speedtest(ip: str, src_color: str) -> None:
             )
             r2.raise_for_status()
             data = r2.json().get("data", [])
-            if not data:
-                log(ip, f"Speedtest: no result by source_local_ip either — raw: {r2.text[:400]}")
-                raise ValueError("no completed result found in statistics")
+            if data:
+                log(ip, f"Speedtest: result found by source_local_ip on attempt {attempt}")
+                break
+            log(ip, f"Speedtest: no result by source_local_ip on attempt {attempt} — raw: {r2.text[:400]}")
+        if not data:
+            raise ValueError("no completed result found in statistics after 4 attempts")
 
         result = data[0]
         dl = result.get("down_speed", 0)
@@ -1362,9 +1392,11 @@ def move_to_final_config_group(ip: str) -> None:
         log(ip, "vManage: CONFIG already COMPLETE — marking DEPLOYED and resuming pipeline", console=True)
         with state_lock:
             vmanage_status[ip] = "DEPLOYED"
+            existing_spd = speedtest_status.get(ip, "")
         save_status()
         webex_notify(f"✅ **{hostnames.get(ip, ip)}** (`{ip}`): config group DEPLOYED")
-        threading.Thread(target=run_speedtest, args=(ip,), daemon=True).start()
+        if not str(existing_spd).startswith("↓"):
+            threading.Thread(target=run_speedtest, args=(ip,), daemon=True).start()
         _try_trigger_policy_for_site(ip)
         return
 
@@ -1384,9 +1416,11 @@ def move_to_final_config_group(ip: str) -> None:
             log(ip, "vManage: CONFIG now COMPLETE — marking DEPLOYED and resuming pipeline", console=True)
             with state_lock:
                 vmanage_status[ip] = "DEPLOYED"
+                existing_spd = speedtest_status.get(ip, "")
             save_status()
             webex_notify(f"✅ **{hostnames.get(ip, ip)}** (`{ip}`): config group DEPLOYED")
-            threading.Thread(target=run_speedtest, args=(ip,), daemon=True).start()
+            if not str(existing_spd).startswith("↓"):
+                threading.Thread(target=run_speedtest, args=(ip,), daemon=True).start()
             _try_trigger_policy_for_site(ip)
             return
 
@@ -2068,6 +2102,22 @@ def _collect_one(ip: str) -> None:
         log(ip, f"Speedtest {reason} — re-spawning", console=True)
         threading.Thread(target=run_speedtest, args=(ip,), daemon=True).start()
 
+    # Retry failed policy deploy (with 5-minute cooldown between attempts)
+    with state_lock:
+        pol_st      = policy_status.get(ip)
+        spd_st      = str(speedtest_status.get(ip, ''))
+        vm_st       = vmanage_status.get(ip)
+        retry_after = _policy_retry_after.get(ip, 0)
+    if (pol_st == "FAILED"
+            and vm_st == "DEPLOYED"
+            and spd_st.startswith('↓')
+            and ip not in _speedtest_running
+            and time.time() >= retry_after):
+        log(ip, "Policy deploy previously FAILED — re-triggering", console=True)
+        with state_lock:
+            _policy_retry_after[ip] = time.time() + 300
+        _try_trigger_policy_for_site(ip)
+
     # Site completion: Dialer1 connected, only G0/1/0 live (provisioning + temp ports down),
     # all pipeline stages done (policy DEPLOYED for every router at the site).
     with state_lock:
@@ -2177,7 +2227,7 @@ def print_status(display_order: list[str], now: float) -> None:
                 else:
                     cfg = cfg_device
                 pol_deploy = policy_status.get(ip, '')
-                policy = pol_deploy if pol_deploy and pol_deploy != "FAILED" else info.get('policy', '')
+                policy = pol_deploy if pol_deploy else info.get('policy', '')
                 if ip in circuit_ping_offline:
                     wan_ip  = wan_ip_cache.get(ip, '')
                     circuit = f"OFFLINE ({wan_ip})" if wan_ip else "OFFLINE"
@@ -2293,7 +2343,7 @@ def main() -> None:
         resume_policy_candidates = [
             ip for ip in ips
             if vmanage_status.get(ip) == "DEPLOYED"
-            and policy_status.get(ip) not in ("DEPLOYED", "FAILED", "SKIPPED")
+            and policy_status.get(ip) not in ("DEPLOYED", "SKIPPED")
         ]
     for ip in resume_policy_candidates:
         _try_trigger_policy_for_site(ip)
