@@ -753,10 +753,19 @@ def _try_trigger_policy_for_site(trigger_ip: str) -> None:
             return
         site_key = re.sub(r'-R\d+$', '', hostname)
 
+        # Build site_ips from csv_vars (all devices in CSV) so an offline R2
+        # that hasn't SSH'd yet is still included in the gate check.
         site_ips = [
-            ip for ip, hn in hostnames.items()
-            if re.sub(r'-R\d+$', '', hn) == site_key
+            ip for ip, row in csv_vars.items()
+            if re.sub(r'-R\d+$', '', row.get('Host Name', '')) == site_key
+            and ip in ping_results
         ]
+        if not site_ips:
+            # csv_vars not loaded or site not in CSV — fall back to known hostnames
+            site_ips = [
+                ip for ip, hn in hostnames.items()
+                if re.sub(r'-R\d+$', '', hn) == site_key
+            ]
         if not site_ips:
             return
 
@@ -1316,7 +1325,20 @@ def _vmanage_build_variable_list(ip: str, target_group: str, uuid: str, csv_row:
             elif vtype is float:
                 converted = float(raw)
             else:
-                converted = raw
+                # Unknown type — infer from value rather than sending a raw string,
+                # which causes SCHVALID0001 for numeric/boolean fields whose template
+                # device had null values and so contributed no type information.
+                raw_lower = raw.lower()
+                if raw_lower in ("true", "false"):
+                    converted = raw_lower == "true"
+                else:
+                    try:
+                        converted = int(raw)
+                    except ValueError:
+                        try:
+                            converted = float(raw)
+                        except ValueError:
+                            converted = raw
         except (ValueError, TypeError):
             converted = raw
 
