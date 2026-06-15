@@ -876,6 +876,8 @@ def deploy_policy_group_for_site(site_ips: list[str]) -> None:
 
         # ── Step 3: Set variables for all devices in one call ─────────────────
         set_all("SETTING VARS")
+        for _ip, _uuid, _vl in devices_info:
+            log(log_ip, f"vManage: policy variables for {_ip}: { {v['name']: v['value'] for v in _vl} }")
         log(log_ip, "vManage: setting policy group variables for all devices", console=True)
         resp = vmanage_session.put(
             f"{VMANAGE_BASE_URL}/dataservice/v1/policy-group/{VMANAGE_POLICY_GROUP_UUID}/device/variables",
@@ -1321,6 +1323,7 @@ def _vmanage_build_variable_list(ip: str, target_group: str, uuid: str, csv_row:
                     val = v.get("value")
                     if val is not None:
                         type_map[name] = type(val)
+                log(ip, f"vManage: {group_type} schema — {len(all_var_names)} var(s), types: { {n: type_map[n].__name__ for n in all_var_names if n in type_map} }")
     except Exception as exc:
         log(ip, f"vManage: variable list fetch failed (using inference): {exc}")
 
@@ -1354,6 +1357,8 @@ def _vmanage_build_variable_list(ip: str, target_group: str, uuid: str, csv_row:
                 converted = int(float(raw))
             elif vtype is float:
                 converted = float(raw)
+            elif vtype is str:
+                converted = raw
             else:
                 # Unknown type — infer from value rather than sending a raw string,
                 # which causes SCHVALID0001 for numeric/boolean fields whose template
