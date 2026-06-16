@@ -132,6 +132,7 @@ _policy_retry_after:  dict[str, float] = {}    # ip -> earliest epoch to retry a
 _site_complete_notified: set[str]     = set()  # site-keys where completion alert was sent
 _bin_missing_notify_after: dict[str, float] = {}  # ip -> earliest epoch for next bin-missing Webex alert
 csv_vars:             dict[str, dict]  = {}   # system-ip -> full variable row from CSV
+circuit_type:         dict[str, str]   = {}   # management ip -> "new" | "migrated"
 vmanage_tasks:        list[dict]      = []   # active tasks polled from vManage API
 vmanage_tasks_lock    = threading.Lock()
 state_lock    = threading.Lock()
@@ -409,6 +410,41 @@ def extract_172_ips(filepath: str) -> tuple[list[str], list[str]]:
         print(f"ERROR: Cannot open {filepath}")
         sys.exit(1)
     return ips, display_order
+
+
+def parse_circuit_types(filepath: str) -> dict[str, str]:
+    """
+    Parse pingips.txt and return a dict mapping each management IP (172.x) to
+    'new' or 'migrated'.
+
+    A non-172 IP on a line immediately before a 172.x IP is that router's WAN
+    IP — meaning the router is using a pre-existing (migrated) broadband circuit.
+    A 172.x IP with no preceding WAN IP is on a new circuit.
+
+    Comment (#) or blank lines reset the WAN-IP association.
+    """
+    result: dict[str, str] = {}
+    pending_wan = False
+    ip_re = re.compile(r"^\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s*$")
+    try:
+        with open(filepath, "r", errors="replace") as fh:
+            for line in fh:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    pending_wan = False
+                    continue
+                m = ip_re.match(stripped)
+                if not m:
+                    continue
+                addr = m.group(1)
+                if addr.startswith("172."):
+                    result[addr] = "migrated" if pending_wan else "new"
+                    pending_wan = False
+                else:
+                    pending_wan = True
+    except FileNotFoundError:
+        pass
+    return result
 
 
 def ping_once(ip: str) -> bool:
@@ -783,8 +819,9 @@ def _try_trigger_policy_for_site(trigger_ip: str) -> None:
             log(trigger_ip, f"Policy trigger: waiting — no speedtest complete yet for site {site_key}")
             return
 
-        # Don't fire while any speedtest is still running — it would race with the deploy
-        running = [ip for ip in site_ips if ip in _speedtest_running]
+        # Don't fire while any speedtest is actively running — it would race with the deploy.
+        # "WAIT CIRCUIT" is not an active test (the thread is just sleeping) so don't block on it.
+        running = [ip for ip in site_ips if speedtest_status.get(ip) == "RUNNING"]
         if running:
             log(trigger_ip, f"Policy trigger: waiting — speedtest still running on {running}")
             return
@@ -1275,9 +1312,35 @@ def _run_speedtest(ip: str, src_color: str) -> None:
             upgrade_ok = completed.get(ip) in PIPELINE_READY
             config_ok  = vmanage_status.get(ip) == "DEPLOYED"
             if upgrade_ok and config_ok and site_key not in ready_for_switch:
-                ready_for_switch[site_key] = hostname
-                log(ip, f"{hostname} is READY for SWITCH", console=True)
-                webex_notify(f"✅ **{hostname}** is READY for SWITCH — {label}")
+                # Find all routers at this site (CSV is authoritative; fall back to hostnames)
+                site_ips = [
+                    i for i, row in csv_vars.items()
+                    if re.sub(r'-R\d+$', '', row.get('Host Name', '')) == site_key
+                ]
+                if not site_ips:
+                    site_ips = [i for i, hn in hostnames.items()
+                                if re.sub(r'-R\d+$', '', hn) == site_key]
+
+                new_circuit_ips      = [i for i in site_ips if circuit_type.get(i) == 'new']
+                migrated_circuit_ips = [i for i in site_ips if circuit_type.get(i) == 'migrated']
+
+                if len(site_ips) <= 1:
+                    # Single router — fire immediately on speedtest completion
+                    required_ips = site_ips or [ip]
+                elif not new_circuit_ips:
+                    # All migrated circuits — first speedtest done is enough
+                    required_ips = [ip]
+                elif not migrated_circuit_ips:
+                    # All new circuits — every router must complete speedtest
+                    required_ips = site_ips
+                else:
+                    # Mixed — only the new-circuit router(s) must complete
+                    required_ips = new_circuit_ips
+
+                if all(str(speedtest_status.get(i, '')).startswith('↓') for i in required_ips):
+                    ready_for_switch[site_key] = hostname
+                    log(ip, f"{hostname} is READY for SWITCH (circuit types: {[(i, circuit_type.get(i,'?')) for i in site_ips]})", console=True)
+                    webex_notify(f"✅ **{hostname}** is READY for SWITCH — {label}")
 
         _try_trigger_policy_for_site(ip)
 
@@ -1405,6 +1468,16 @@ def move_to_final_config_group(ip: str) -> None:
         _try_trigger_policy_for_site(ip)
         return
 
+    # Claim the deploy slot atomically so a concurrent _collect_one trigger
+    # (which fires when vmanage_status is None and ssh_config is REQUIRED) bails
+    # out rather than running a second full deploy in parallel.
+    with state_lock:
+        current_vm = vmanage_status.get(ip)
+        if current_vm in ("WAITING", "ASSOCIATING", "SETTING VARS", "DEPLOYING"):
+            log(ip, f"vManage: config deploy already in-progress ({current_vm}) — skipping duplicate", console=True)
+            return
+        vmanage_status[ip] = "WAITING"
+
     if config_status == '?':
         # Info not yet collected post-reboot — wait up to 3 minutes for the info collector to populate it
         log(ip, "vManage: CONFIG not yet polled — waiting for info collector…", console=True)
@@ -1435,9 +1508,6 @@ def move_to_final_config_group(ip: str) -> None:
             vmanage_status[ip] = "SKIPPED"
         save_status()
         return
-
-    with state_lock:
-        vmanage_status[ip] = "WAITING"
 
     if not _wait_for_vmanage_idle(ip):
         log(ip, "vManage: timed out waiting for running tasks to clear — skipping move", console=True)
@@ -2107,18 +2177,19 @@ def _collect_one(ip: str) -> None:
         log(ip, f"Speedtest {reason} — re-spawning", console=True)
         threading.Thread(target=run_speedtest, args=(ip,), daemon=True).start()
 
-    # Retry failed policy deploy (with 5-minute cooldown between attempts)
+    # Retry or initially trigger policy deploy (5-minute cooldown between attempts).
+    # Fires for both FAILED (previous attempt errored) and None (never triggered — e.g.
+    # because a site-mate was stuck in WAIT CIRCUIT when config deploy completed).
     with state_lock:
         pol_st      = policy_status.get(ip)
         spd_st      = str(speedtest_status.get(ip, ''))
         vm_st       = vmanage_status.get(ip)
         retry_after = _policy_retry_after.get(ip, 0)
-    if (pol_st == "FAILED"
+    if (pol_st in ("FAILED", None)
             and vm_st == "DEPLOYED"
             and spd_st.startswith('↓')
-            and ip not in _speedtest_running
             and time.time() >= retry_after):
-        log(ip, "Policy deploy previously FAILED — re-triggering", console=True)
+        log(ip, f"Policy not yet deployed (status={pol_st!r}) — checking trigger conditions", console=True)
         with state_lock:
             _policy_retry_after[ip] = time.time() + 300
         _try_trigger_policy_for_site(ip)
@@ -2312,6 +2383,7 @@ def main() -> None:
     if not ips:
         print(f"No 172.x.x.x addresses found in {PING_FILE}")
         sys.exit(1)
+    circuit_type.update(parse_circuit_types(PING_FILE))
 
     # Initialise ping state for all IPs, then overlay saved status
     for ip in ips:
