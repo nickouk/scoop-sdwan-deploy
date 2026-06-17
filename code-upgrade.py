@@ -131,6 +131,7 @@ _speedtest_retry_after: dict[str, float] = {}  # ip -> earliest epoch to retry a
 _policy_retry_after:  dict[str, float] = {}    # ip -> earliest epoch to retry a failed policy deploy
 _site_complete_notified: set[str]     = set()  # site-keys where completion alert was sent
 _bin_missing_notify_after: dict[str, float] = {}  # ip -> earliest epoch for next bin-missing Webex alert
+_last_coffee_break: float = 0.0
 csv_vars:             dict[str, dict]  = {}   # system-ip -> full variable row from CSV
 circuit_type:         dict[str, str]   = {}   # management ip -> "new" | "migrated"
 vmanage_tasks:        list[dict]      = []   # active tasks polled from vManage API
@@ -2081,6 +2082,7 @@ def ping_loop(ips: list[str], display_order: list[str]) -> None:
 
         # Print status summary
         print_status(display_order, now)
+        _maybe_coffee_break()
         time.sleep(PING_INTERVAL)
 
 
@@ -2257,6 +2259,81 @@ def info_collector_loop(ips: list[str]) -> None:
 
 _DASH_WIDTH = 192
 
+# ── Hourly coffee break animation ─────────────────────────────────────────────
+
+_COFFEE_FRAMES: list[tuple[float, str]] = [
+    (0.8, """
+  ╔══════════════════════════════════════════╗
+  ║  ⏰  ONE HOUR IN — COFFEE TIME, BOB!  ⏰║
+  ╚══════════════════════════════════════════╝
+"""),
+    (1.0, """
+      O
+     /|\\            "Wait... is that the time?!"
+     / \\
+      BOB
+"""),
+    (0.9, """
+      O   →→→     ___________
+     /|\\          |   COFFEE  |   "Oh yes."
+     / \\          |_MACHINE___|
+      BOB
+"""),
+    (1.3, """
+            ___________
+      O     |  ●  BREW |  *BRRRRR*
+     /|\\    |__________|
+     / \\
+                          ♨  ♨  ♨   Brewing...
+"""),
+    (0.9, """
+            ___________
+      O     |  ~~~~~   |
+     /|\\    |____☕____|   Done!
+     / \\
+"""),
+    (0.8, """
+      O  ☕
+     /|/ ←←
+     / \\              "Got it!"
+"""),
+    (1.3, """
+      O
+     /|☕               *S L U R P*
+     / \\
+                        "Mmmmmmmm..."
+"""),
+    (1.6, """
+      O   ♥ ♥
+     \\|/    ♥           "AHHHHHHHH."
+      |
+     / \\                That. Hit. Different.
+"""),
+    (5.0, """
+  ╔══════════════════════════════════════════╗
+  ║  ☕  Recharged. Resuming deployment!    ║
+  ╚══════════════════════════════════════════╝
+"""),
+]
+
+
+def _coffee_break_animation() -> None:
+    """Play the ASCII coffee break — holds print_lock for the full sequence."""
+    with print_lock:
+        for delay, frame in _COFFEE_FRAMES:
+            sys.stdout.write(frame)
+            sys.stdout.flush()
+            time.sleep(delay)
+
+
+def _maybe_coffee_break() -> None:
+    """Spawn the coffee break thread if an hour has elapsed since the last one."""
+    global _last_coffee_break
+    if time.time() - _last_coffee_break >= 3600:
+        _last_coffee_break = time.time()
+        threading.Thread(target=_coffee_break_animation, daemon=True).start()
+
+
 def print_status(display_order: list[str], now: float) -> None:
     with print_lock:
         print("\033[2J\033[H", end="")  # clear screen, cursor to top
@@ -2347,6 +2424,12 @@ def print_status(display_order: list[str], now: float) -> None:
                         if user:
                             parts.append(f"user={user}")
                         print("  ".join(parts))
+
+        secs_to_coffee = max(0, 3600 - (time.time() - _last_coffee_break))
+        if secs_to_coffee <= 300:
+            mins, secs = divmod(int(secs_to_coffee), 60)
+            print(f"  ☕  Coffee break in {mins}m {secs:02d}s")
+
         print()
 
 
@@ -2389,6 +2472,10 @@ def main() -> None:
     for ip in ips:
         ping_results[ip] = "Down"
     load_status(ips)
+
+    global _last_coffee_break
+    if _last_coffee_break == 0.0:
+        _last_coffee_break = time.time()   # first coffee break fires one hour from now
 
     webex_notify(f"🚀 SD-WAN deployment pipeline started — monitoring **{len(ips)}** device(s)")
 
@@ -2447,4 +2534,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--coffee":
+        _coffee_break_animation()
+    else:
+        if len(sys.argv) > 1 and sys.argv[1] == "--coffee-soon":
+            _last_coffee_break = time.time() - 3600 + 45
+        main()
