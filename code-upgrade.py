@@ -35,6 +35,7 @@ RETRY_DELAY     = 300         # seconds before retrying a failed device (5 min)
 PIPELINE_READY  = {"UPGRADE COMPLETE", "ALREADY UP TO DATE"}
 SSH_TIMEOUT     = 30          # seconds for SSH connect/read
 CMD_TIMEOUT     = 600         # seconds to wait for long-running commands
+INSTALL_TIMEOUT = 1500        # seconds to wait for the install command (verify alone can take 16+ min)
 REBOOT_TIMEOUT  = 600         # seconds to wait for device to come back after reboot
 REBOOT_POLL     = 10          # seconds between reboot connectivity checks
 
@@ -612,10 +613,13 @@ def collect_device_info(client: paramiko.SSHClient, ip: str) -> paramiko.SSHClie
 
 
 def run_command(client: paramiko.SSHClient, ip: str, command: str,
-                timeout: int = CMD_TIMEOUT) -> tuple[paramiko.SSHClient, str]:
+                timeout: int = CMD_TIMEOUT,
+                no_retry: bool = False) -> tuple[paramiko.SSHClient, str]:
     """
     Execute a command and return (client, output).
     If the SSH transport has dropped, reconnects automatically before running.
+    If no_retry=True, SSH timeout exceptions are re-raised instead of retried
+    (use for long-running commands where a blind retry would be wrong).
     """
     transport = client.get_transport()
     if transport is None or not transport.is_active():
@@ -632,6 +636,8 @@ def run_command(client: paramiko.SSHClient, ip: str, command: str,
         output = stdout.read().decode(errors="replace")
         err    = stderr.read().decode(errors="replace")
     except (EOFError, socket.timeout, TimeoutError) as exc:
+        if no_retry:
+            raise
         log(ip, f"SSH channel {type(exc).__name__} — reconnecting and retrying")
         try:
             client.close()
@@ -1778,6 +1784,69 @@ def wait_for_reboot(ip: str) -> bool:
     return False
 
 
+# ── Install operation status helpers ──────────────────────────────────────────
+
+def _query_install_op_status(client: paramiko.SSHClient, ip: str) -> tuple[paramiko.SSHClient, str]:
+    """
+    After an install SSH timeout or reconnect, determine whether the platform
+    install operation is still running, succeeded, or failed.
+
+    Runs both:
+      show platform software install RP active operation current detail
+      show platform software install RP active operation history detail
+
+    Returns (client, status) where status is one of:
+      "success"  — most recent add completed OK
+      "running"  — operation still in progress
+      "failed"   — operation reported a failure
+      "unknown"  — could not determine outcome
+    """
+    # Check for a currently-running operation
+    client, current = run_command(
+        client, ip,
+        "show platform software install RP active operation current detail",
+        timeout=SSH_TIMEOUT,
+    )
+    if current.strip():
+        log(ip, f"Install operation (current):\n{current.strip()}")
+    else:
+        log(ip, "Install operation (current): no active operation")
+
+    current_s = current.strip().lower()
+    if current_s and "no current" not in current_s and len(current_s) > 20:
+        if "status: failed" in current_s or "status: error" in current_s:
+            return client, "failed"
+        return client, "running"
+
+    # No active operation — check history for the outcome of the last add
+    client, history = run_command(
+        client, ip,
+        "show platform software install RP active operation history detail",
+        timeout=SSH_TIMEOUT,
+    )
+    log(ip, f"Install operation (history):\n{history.strip()}")
+
+    # Parse the summary table lines: <uuid> <op_id> <command> <status> ...
+    for line in history.splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[2] == "add":
+            if parts[3] == "OK":
+                return client, "success"
+            if parts[3] in ("Failed", "FAILED", "Error", "ERROR"):
+                return client, "failed"
+
+    # Fall back to scanning the detail section
+    for line in history.splitlines():
+        ll = line.lower()
+        if "command: add" in ll:
+            if "status: ok" in ll:
+                return client, "success"
+            if "status: fail" in ll or "status: error" in ll:
+                return client, "failed"
+
+    return client, "unknown"
+
+
 # ── Upgrade task (runs in its own thread) ─────────────────────────────────────
 
 def upgrade_device(ip: str) -> None:
@@ -1897,22 +1966,48 @@ def upgrade_device(ip: str) -> None:
 
             if file_missing:
                 # Install may have already run and consumed the bin.
+                # Check software table first, then fall back to operation history.
                 log(ip, f"Install file not found — re-checking software table…")
                 client, sw2 = run_command(client, ip, "show sdwan software")
                 log(ip, f"show sdwan software output:\n{sw2.strip()}")
                 versions2 = parse_sdwan_versions(sw2)
-                if TARGET_VERSION not in versions2:
-                    client.close()
-                    with state_lock:
-                        bin_missing.add(ip)
-                    now = time.time()
-                    suppress = now < _bin_missing_notify_after.get(ip, 0)
-                    if not suppress:
-                        _bin_missing_notify_after[ip] = now + 900  # mute for 15 min after each alert
-                    fail(f"Install file not found and {TARGET_VERSION} not installed: {INSTALL_FILE}",
-                         suppress_webex=suppress)
-                    return
-                log(ip, f"{TARGET_VERSION} present — bin consumed by prior run, skipping to activate")
+                if TARGET_VERSION in versions2:
+                    log(ip, f"{TARGET_VERSION} present — bin consumed by prior run, skipping to activate")
+                else:
+                    # show sdwan software may not list a staged-but-not-activated install.
+                    # Check the platform install operation history for a successful add.
+                    log(ip, f"{TARGET_VERSION} not in software table — checking install operation history…")
+                    client, op_status = _query_install_op_status(client, ip)
+                    if op_status == "success":
+                        log(ip, f"{TARGET_VERSION} confirmed staged by install operation history — skipping to activate", console=True)
+                    elif op_status == "running":
+                        log(ip, "Install operation still running — will poll for completion", console=True)
+                        poll_deadline = time.time() + INSTALL_TIMEOUT
+                        while True:
+                            if time.time() >= poll_deadline:
+                                client.close()
+                                fail("Install timed out waiting for in-progress operation")
+                                return
+                            time.sleep(60)
+                            client, op_status = _query_install_op_status(client, ip)
+                            if op_status == "success":
+                                log(ip, "Install operation completed successfully", console=True)
+                                break
+                            if op_status in ("failed", "unknown"):
+                                client.close()
+                                fail(f"Install operation {op_status} (detected via history while bin missing)")
+                                return
+                    else:
+                        client.close()
+                        with state_lock:
+                            bin_missing.add(ip)
+                        now = time.time()
+                        suppress = now < _bin_missing_notify_after.get(ip, 0)
+                        if not suppress:
+                            _bin_missing_notify_after[ip] = now + 900
+                        fail(f"Install file not found and {TARGET_VERSION} not installed: {INSTALL_FILE}",
+                             suppress_webex=suppress)
+                        return
             else:
                 log(ip, "Install file found on bootflash")
 
@@ -1937,12 +2032,45 @@ def upgrade_device(ip: str) -> None:
                 install_cmd = (
                     f"request platform software sdwan software install {INSTALL_FILE}"
                 )
-                client, install_output = run_command(client, ip, install_cmd, timeout=CMD_TIMEOUT)
-                log(ip, f"Install output:\n{install_output.strip()}")
-                if "error" in install_output.lower() or "failed" in install_output.lower():
-                    client.close()
-                    fail("Install command reported an error")
-                    return
+                try:
+                    client, install_output = run_command(
+                        client, ip, install_cmd,
+                        timeout=INSTALL_TIMEOUT, no_retry=True,
+                    )
+                    log(ip, f"Install output:\n{install_output.strip()}")
+                    if "error" in install_output.lower() or "failed" in install_output.lower():
+                        client.close()
+                        fail("Install command reported an error")
+                        return
+                except (EOFError, socket.timeout, TimeoutError) as exc:
+                    log(ip, f"Install SSH timeout ({type(exc).__name__}) — reconnecting to check operation status", console=True)
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                    client = ssh_connect(ip)
+                    poll_deadline = time.time() + INSTALL_TIMEOUT
+                    while True:
+                        client, op_status = _query_install_op_status(client, ip)
+                        if op_status == "success":
+                            log(ip, "Install completed successfully (confirmed after SSH timeout)", console=True)
+                            break
+                        if op_status == "failed":
+                            client.close()
+                            fail("Install failed (confirmed by operation history)")
+                            return
+                        if op_status == "running":
+                            if time.time() >= poll_deadline:
+                                client.close()
+                                fail("Install timed out waiting for operation to complete")
+                                return
+                            log(ip, "Install still in progress — waiting 60s before recheck", console=True)
+                            time.sleep(60)
+                            continue
+                        # "unknown" — cannot determine outcome
+                        client.close()
+                        fail("Install operation status unknown after SSH timeout")
+                        return
 
             # ── Step 5: Activate (triggers reboot) ────────────────────────────
             set_step("ACTIVATING")
@@ -2327,10 +2455,11 @@ def _coffee_break_animation() -> None:
 
 
 def _maybe_coffee_break() -> None:
-    """Spawn the coffee break thread if an hour has elapsed since the last one."""
+    """Spawn the coffee break thread once per clock hour, on the hour."""
     global _last_coffee_break
-    if time.time() - _last_coffee_break >= 3600:
-        _last_coffee_break = time.time()
+    current_hour_ts = datetime.now().replace(minute=0, second=0, microsecond=0).timestamp()
+    if current_hour_ts > _last_coffee_break:
+        _last_coffee_break = current_hour_ts
         threading.Thread(target=_coffee_break_animation, daemon=True).start()
 
 
@@ -2425,9 +2554,10 @@ def print_status(display_order: list[str], now: float) -> None:
                             parts.append(f"user={user}")
                         print("  ".join(parts))
 
-        secs_to_coffee = max(0, 3600 - (time.time() - _last_coffee_break))
+        _now_dt = datetime.now()
+        secs_to_coffee = 3600 - (_now_dt.minute * 60 + _now_dt.second)
         if secs_to_coffee <= 300:
-            mins, secs = divmod(int(secs_to_coffee), 60)
+            mins, secs = divmod(secs_to_coffee, 60)
             print(f"  ☕  Coffee break in {mins}m {secs:02d}s")
 
         print()
@@ -2475,7 +2605,7 @@ def main() -> None:
 
     global _last_coffee_break
     if _last_coffee_break == 0.0:
-        _last_coffee_break = time.time()   # first coffee break fires one hour from now
+        _last_coffee_break = datetime.now().replace(minute=0, second=0, microsecond=0).timestamp()
 
     webex_notify(f"🚀 SD-WAN deployment pipeline started — monitoring **{len(ips)}** device(s)")
 
@@ -2538,5 +2668,8 @@ if __name__ == "__main__":
         _coffee_break_animation()
     else:
         if len(sys.argv) > 1 and sys.argv[1] == "--coffee-soon":
-            _last_coffee_break = time.time() - 3600 + 45
+            def _coffee_soon():
+                time.sleep(45)
+                _coffee_break_animation()
+            threading.Thread(target=_coffee_soon, daemon=True).start()
         main()
