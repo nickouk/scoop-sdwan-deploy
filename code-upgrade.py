@@ -1212,8 +1212,9 @@ def _run_speedtest(ip: str, src_color: str) -> None:
         ).raise_for_status()
 
         # Poll until completed or timeout
-        deadline = time.time() + 300
+        deadline = time.time() + 600
         last_status = "unknown"
+        _consecutive_tbst1014 = 0
         while time.time() < deadline:
             time.sleep(5)
             r = vmanage_session.get(
@@ -1222,7 +1223,27 @@ def _run_speedtest(ip: str, src_color: str) -> None:
             )
             if not r.ok:
                 log(ip, f"Speedtest: poll HTTP {r.status_code} — {r.text[:200]}")
+                # TBST1014 = device still running a prior stuck speedtest that
+                # our disable call didn't clear.  If this persists, back off and
+                # let the device finish/reset on its own.
+                try:
+                    if r.json().get("error", {}).get("code", "") == "TBST1014":
+                        _consecutive_tbst1014 += 1
+                        if _consecutive_tbst1014 >= 6:   # 30s of consecutive blocks
+                            with state_lock:
+                                _speedtest_retry_after[ip] = time.time() + 600
+                            raise ValueError(
+                                f"TBST1014: device has a stuck speedtest blocking session "
+                                f"{session_id} — backing off 10 minutes"
+                            )
+                    else:
+                        _consecutive_tbst1014 = 0
+                except ValueError:
+                    raise
+                except Exception:
+                    _consecutive_tbst1014 = 0
                 continue
+            _consecutive_tbst1014 = 0
             try:
                 body = r.json()
                 if isinstance(body, dict) and "status" in body:
@@ -1242,7 +1263,7 @@ def _run_speedtest(ip: str, src_color: str) -> None:
             if status in ("completed", "complete", "done"):
                 break
         else:
-            log(ip, f"Speedtest: poll timed out after 300s — last status={last_status!r}")
+            log(ip, f"Speedtest: poll timed out after 600s — last status={last_status!r}")
 
         # Clean up session
         vmanage_session.get(
@@ -1847,6 +1868,40 @@ def _query_install_op_status(client: paramiko.SSHClient, ip: str) -> tuple[param
     return client, "unknown"
 
 
+def _wait_for_site_peers_before_reboot(ip: str) -> None:
+    """
+    Hold an activate/reboot if this device owns the active WAN circuit and a
+    site peer is still mid-upgrade.  The peer routes through our WAN via TLOC
+    extension, so rebooting us now would kill its SSH session.
+    """
+    with state_lock:
+        my_circuit = device_info.get(ip, {}).get('circuit', '')
+
+    if not my_circuit.startswith("CONNECTED"):
+        return  # we don't own the WAN — our reboot can't hurt peers
+
+    hostname = hostnames.get(ip, "")
+    if not hostname:
+        return
+    site_key = re.sub(r'-R\d+$', '', hostname)
+
+    while True:
+        with state_lock:
+            blocking = {
+                i: in_progress_step.get(i, 'upgrading')
+                for i, hn in hostnames.items()
+                if i != ip
+                and re.sub(r'-R\d+$', '', hn) == site_key
+                and i in in_progress
+            }
+        if not blocking:
+            return
+        log(ip,
+            f"Holding activate — peer(s) upgrading via our WAN circuit: {blocking}",
+            console=True)
+        time.sleep(30)
+
+
 # ── Upgrade task (runs in its own thread) ─────────────────────────────────────
 
 def upgrade_device(ip: str) -> None:
@@ -1931,6 +1986,7 @@ def upgrade_device(ip: str) -> None:
             log(ip, f"{TARGET_VERSION} is installed but not active — resuming at activate", console=True)
 
             # ── Step 5: Activate (triggers reboot) ────────────────────────────
+            _wait_for_site_peers_before_reboot(ip)
             set_step("ACTIVATING")
             activate_cmd = (
                 f"request platform software sdwan software activate {TARGET_VERSION}"
@@ -2073,6 +2129,7 @@ def upgrade_device(ip: str) -> None:
                         return
 
             # ── Step 5: Activate (triggers reboot) ────────────────────────────
+            _wait_for_site_peers_before_reboot(ip)
             set_step("ACTIVATING")
             activate_cmd = (
                 f"request platform software sdwan software activate {TARGET_VERSION}"
