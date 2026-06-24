@@ -961,6 +961,11 @@ def deploy_policy_group_for_site(site_ips: list[str]) -> None:
             body = resp.json()
             action_id = body.get("id") or body.get("actionId") or body.get("taskId")
             if not action_id:
+                # vManage 20.15 returns parentTaskId = "deploy_policy_group-{uuid}"
+                parent = body.get("parentTaskId", "")
+                if parent and "-" in parent:
+                    action_id = parent.split("-", 1)[1]   # strip "deploy_policy_group-" prefix
+            if not action_id:
                 log(log_ip, f"vManage: policy deploy response body (no action ID): {body}")
         except Exception:
             pass
@@ -1651,6 +1656,11 @@ def move_to_final_config_group(ip: str) -> None:
         try:
             body = resp.json()
             action_id = body.get("id") or body.get("actionId") or body.get("taskId")
+            if not action_id:
+                # vManage 20.15 returns parentTaskId = "deploy_config_group-{uuid}"
+                parent = body.get("parentTaskId", "")
+                if parent and "-" in parent:
+                    action_id = parent.split("-", 1)[1]   # strip "deploy_config_group-" prefix
             if not action_id:
                 log(ip, f"vManage: config deploy response body: {body}")
         except Exception:
