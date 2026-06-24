@@ -463,16 +463,23 @@ def ping_once(ip: str) -> bool:
 
 def ssh_connect(ip: str) -> paramiko.SSHClient:
     """
-    Try local credentials first; fall back to ISE credentials.
-    Returns an open SSHClient or raises an exception.
+    Credential order depends on config deploy state:
+      not yet deployed → local first, ISE fallback
+      deployed         → ISE first, local fallback
+    The other set is always tried if the primary fails.
     """
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-    for user, passwd, label in [
-        (local_user, local_pass, "local"),
-        (ise_user,   ise_pass,   "ISE"),
-    ]:
+    with state_lock:
+        deployed = vmanage_status.get(ip) == "DEPLOYED"
+
+    if deployed:
+        cred_order = [(ise_user, ise_pass, "ISE"), (local_user, local_pass, "local")]
+    else:
+        cred_order = [(local_user, local_pass, "local"), (ise_user, ise_pass, "ISE")]
+
+    for user, passwd, label in cred_order:
         try:
             client.connect(
                 ip,
@@ -1877,8 +1884,10 @@ def _wait_for_site_peers_before_reboot(ip: str) -> None:
     with state_lock:
         my_circuit = device_info.get(ip, {}).get('circuit', '')
 
-    if not my_circuit.startswith("CONNECTED"):
+    if my_circuit.startswith("NOT CONNECTED"):
         return  # we don't own the WAN — our reboot can't hurt peers
+    # If circuit state is unknown (info_collector hasn't run yet for this device),
+    # treat conservatively as potentially CONNECTED and check peers.
 
     hostname = hostnames.get(ip, "")
     if not hostname:
