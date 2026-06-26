@@ -46,6 +46,8 @@ VMANAGE_BASE_URL      = "https://vmanage-953677893.sdwan.cisco.com:8443"
 SPEEDTEST_DST_IP      = "172.31.116.1"    # SC-1-0001-THN-R1
 SPEEDTEST_DST_COLOR   = "public-internet"
 SPEEDTEST_SRC_COLOR   = {"1": "blue", "2": "green"}   # keyed by device index (R1/R2)
+SPEEDTEST_POLL_TIMEOUT = 240   # seconds per attempt (real tests complete in <2 min)
+SPEEDTEST_MAX_ATTEMPTS = 2     # one retry on timeout before flagging as stuck (CSCwb48953)
 VMANAGE_ONBOARD_UUID = "8cd9fc8a-a552-41be-95f5-42fc4bcc6ad9"
 VMANAGE_POLICY_GROUP_UUID = "ade1666a-8d3c-4ba3-a641-b38a129eeda3"  # remote_sites_policy_group
 VMANAGE_FINAL_GROUPS = {
@@ -1070,6 +1072,10 @@ def deploy_policy_group_for_site(site_ips: list[str]) -> None:
     save_status()
 
 
+class _SpeedtestStuckError(Exception):
+    """Raised when a speedtest poll times out on all retry attempts (likely CSCwb48953)."""
+
+
 def run_speedtest(ip: str) -> None:
     """
     Run a speedtest from this device to the THN hub. Runs in its own thread.
@@ -1187,6 +1193,7 @@ def _run_speedtest(ip: str, src_color: str) -> None:
     with state_lock:
         speedtest_status[ip] = "RUNNING"
 
+    hostname = hostnames.get(ip, ip)
     log(ip, f"Speedtest: starting  src={ip} color={src_color}  dst={SPEEDTEST_DST_IP} color={SPEEDTEST_DST_COLOR}", console=True)
 
     try:
@@ -1217,114 +1224,136 @@ def _run_speedtest(ip: str, src_color: str) -> None:
             timeout=15,
         )
 
-        # Start speedtest session
-        resp = vmanage_session.post(
-            f"{VMANAGE_BASE_URL}/dataservice/stream/device/speed",
-            json={
-                "deviceUUID":       src_uuid,
-                "sourceIp":         ip,
-                "sourceColor":      src_color,
-                "destinationIp":    SPEEDTEST_DST_IP,
-                "destinationColor": SPEEDTEST_DST_COLOR,
-                "port":             "80",
-            },
-            timeout=30,
-        )
-        if not resp.ok:
-            log(ip, f"Speedtest: POST /stream/device/speed HTTP {resp.status_code}: {resp.text[:400]}")
-            # TBST1008 = another session is still active on vManage (e.g. orphaned from a
-            # script restart). We don't have the session_id, so set a backoff and let
-            # the session expire naturally on vManage before retrying.
-            try:
-                err_code = resp.json().get("error", {}).get("code", "")
-            except Exception:
-                err_code = ""
-            if err_code == "TBST1008":
-                # Try to find and disable the orphaned session via statistics API
-                # (catches the case where the session ID wasn't persisted across restarts)
-                killed = _kill_orphaned_speedtest_session(ip)
-                if killed:
-                    # Short wait then let the caller retry immediately
-                    with state_lock:
-                        _speedtest_retry_after[ip] = time.time() + 15
-                    log(ip, "Speedtest: TBST1008 — disabled orphaned session, retrying in 15s", console=True)
-                else:
-                    with state_lock:
-                        _speedtest_retry_after[ip] = time.time() + 300
-                    log(ip, "Speedtest: TBST1008 — orphaned session active, backing off 5 minutes", console=True)
-        resp.raise_for_status()
-        session_id = resp.json()["sessionId"]
-        with state_lock:
-            _speedtest_session[ip] = session_id
-        log(ip, f"Speedtest: session {session_id}")
+        # Run up to SPEEDTEST_MAX_ATTEMPTS attempts. A single poll timeout may be
+        # transient; two consecutive timeouts indicate a stuck session (CSCwb48953)
+        # requiring manual router reboot rather than an automatic retry.
+        session_id = None
+        session_timed_out = False
+        for attempt in range(1, SPEEDTEST_MAX_ATTEMPTS + 1):
+            if attempt > 1:
+                log(ip, f"Speedtest [{hostname}]: attempt {attempt}/{SPEEDTEST_MAX_ATTEMPTS} — "
+                    f"retrying after timeout (CSCwb48953 stuck-session check)", console=True)
+                time.sleep(15)
 
-        # Kick off
-        vmanage_session.get(
-            f"{VMANAGE_BASE_URL}/dataservice/stream/device/speed/start/{session_id}",
-            timeout=15,
-        ).raise_for_status()
-
-        # Poll until completed or timeout
-        deadline = time.time() + 600
-        last_status = "unknown"
-        _consecutive_tbst1014 = 0
-        while time.time() < deadline:
-            time.sleep(5)
-            r = vmanage_session.get(
-                f"{VMANAGE_BASE_URL}/dataservice/stream/device/speed/{session_id}",
-                params={"logId": 2}, timeout=15,
+            # Start speedtest session
+            resp = vmanage_session.post(
+                f"{VMANAGE_BASE_URL}/dataservice/stream/device/speed",
+                json={
+                    "deviceUUID":       src_uuid,
+                    "sourceIp":         ip,
+                    "sourceColor":      src_color,
+                    "destinationIp":    SPEEDTEST_DST_IP,
+                    "destinationColor": SPEEDTEST_DST_COLOR,
+                    "port":             "80",
+                },
+                timeout=30,
             )
-            if not r.ok:
-                log(ip, f"Speedtest: poll HTTP {r.status_code} — {r.text[:200]}")
-                # TBST1014 = device still running a prior stuck speedtest that
-                # our disable call didn't clear.  If this persists, back off and
-                # let the device finish/reset on its own.
+            if not resp.ok:
+                log(ip, f"Speedtest: POST /stream/device/speed HTTP {resp.status_code}: {resp.text[:400]}")
+                # TBST1008 = another session is still active on vManage (e.g. orphaned from a
+                # script restart). We don't have the session_id, so set a backoff and let
+                # the session expire naturally on vManage before retrying.
                 try:
-                    if r.json().get("error", {}).get("code", "") == "TBST1014":
-                        _consecutive_tbst1014 += 1
-                        if _consecutive_tbst1014 >= 6:   # 30s of consecutive blocks
-                            with state_lock:
-                                _speedtest_retry_after[ip] = time.time() + 600
-                            raise ValueError(
-                                f"TBST1014: device has a stuck speedtest blocking session "
-                                f"{session_id} — backing off 10 minutes"
-                            )
-                    else:
-                        _consecutive_tbst1014 = 0
-                except ValueError:
-                    raise
+                    err_code = resp.json().get("error", {}).get("code", "")
                 except Exception:
-                    _consecutive_tbst1014 = 0
-                continue
-            _consecutive_tbst1014 = 0
-            try:
-                body = r.json()
-                if isinstance(body, dict) and "status" in body:
-                    status = body["status"]
-                elif isinstance(body, dict) and "data" in body:
-                    entries = body.get("data", [])
-                    status = entries[-1].get("status", "progress") if entries else "progress"
-                else:
-                    status = "progress"
-                    log(ip, f"Speedtest: poll unexpected body shape: {str(body)[:200]}")
-            except Exception as exc:
-                status = "progress"
-                log(ip, f"Speedtest: poll parse error: {exc}")
-            if status != last_status:
-                log(ip, f"Speedtest: poll status={status!r}")
-                last_status = status
-            if status in ("completed", "complete", "done"):
-                break
-        else:
-            log(ip, f"Speedtest: poll timed out after 600s — last status={last_status!r}")
+                    err_code = ""
+                if err_code == "TBST1008":
+                    # Try to find and disable the orphaned session via statistics API
+                    # (catches the case where the session ID wasn't persisted across restarts)
+                    killed = _kill_orphaned_speedtest_session(ip)
+                    if killed:
+                        with state_lock:
+                            _speedtest_retry_after[ip] = time.time() + 15
+                        log(ip, "Speedtest: TBST1008 — disabled orphaned session, retrying in 15s", console=True)
+                    else:
+                        with state_lock:
+                            _speedtest_retry_after[ip] = time.time() + 300
+                        log(ip, "Speedtest: TBST1008 — orphaned session active, backing off 5 minutes", console=True)
+            resp.raise_for_status()
+            session_id = resp.json()["sessionId"]
+            with state_lock:
+                _speedtest_session[ip] = session_id
+            log(ip, f"Speedtest: session {session_id} (attempt {attempt}/{SPEEDTEST_MAX_ATTEMPTS})")
 
-        # Clean up session
-        vmanage_session.get(
-            f"{VMANAGE_BASE_URL}/dataservice/stream/device/speed/disable/{session_id}",
-            timeout=15,
-        )
-        with state_lock:
-            _speedtest_session.pop(ip, None)
+            # Kick off
+            vmanage_session.get(
+                f"{VMANAGE_BASE_URL}/dataservice/stream/device/speed/start/{session_id}",
+                timeout=15,
+            ).raise_for_status()
+
+            # Poll until completed, TBST1014-stuck, or per-attempt timeout
+            poll_deadline = time.time() + SPEEDTEST_POLL_TIMEOUT
+            last_status = "unknown"
+            _consecutive_tbst1014 = 0
+            session_timed_out = True   # cleared only on successful completion
+
+            while time.time() < poll_deadline:
+                time.sleep(5)
+                r = vmanage_session.get(
+                    f"{VMANAGE_BASE_URL}/dataservice/stream/device/speed/{session_id}",
+                    params={"logId": 2}, timeout=15,
+                )
+                if not r.ok:
+                    log(ip, f"Speedtest: poll HTTP {r.status_code} — {r.text[:200]}")
+                    # TBST1014 = device has a prior stuck speedtest our disable didn't clear.
+                    # Treat 30s of consecutive TBST1014 the same as a poll timeout so the
+                    # retry/stuck logic handles it uniformly.
+                    try:
+                        if r.json().get("error", {}).get("code", "") == "TBST1014":
+                            _consecutive_tbst1014 += 1
+                            if _consecutive_tbst1014 >= 6:
+                                log(ip, f"Speedtest [{hostname}]: TBST1014 persisting for 30s on "
+                                    f"attempt {attempt}/{SPEEDTEST_MAX_ATTEMPTS} — treating as stuck", console=True)
+                                break  # exit poll loop; session_timed_out stays True
+                        else:
+                            _consecutive_tbst1014 = 0
+                    except Exception:
+                        _consecutive_tbst1014 = 0
+                    continue
+                _consecutive_tbst1014 = 0
+                try:
+                    body = r.json()
+                    if isinstance(body, dict) and "status" in body:
+                        status = body["status"]
+                    elif isinstance(body, dict) and "data" in body:
+                        entries = body.get("data", [])
+                        status = entries[-1].get("status", "progress") if entries else "progress"
+                    else:
+                        status = "progress"
+                        log(ip, f"Speedtest: poll unexpected body shape: {str(body)[:200]}")
+                except Exception as exc:
+                    status = "progress"
+                    log(ip, f"Speedtest: poll parse error: {exc}")
+                if status != last_status:
+                    log(ip, f"Speedtest: poll status={status!r}")
+                    last_status = status
+                if status in ("completed", "complete", "done"):
+                    session_timed_out = False
+                    break
+
+            # Always clean up this attempt's session before moving on
+            try:
+                vmanage_session.get(
+                    f"{VMANAGE_BASE_URL}/dataservice/stream/device/speed/disable/{session_id}",
+                    timeout=15,
+                )
+            except Exception:
+                pass
+            with state_lock:
+                _speedtest_session.pop(ip, None)
+
+            if not session_timed_out:
+                break  # poll completed — proceed to fetch results
+
+            if attempt < SPEEDTEST_MAX_ATTEMPTS:
+                log(ip, f"Speedtest [{hostname}]: poll timed out after {SPEEDTEST_POLL_TIMEOUT}s "
+                    f"(attempt {attempt}/{SPEEDTEST_MAX_ATTEMPTS}) — will retry once", console=True)
+
+        if session_timed_out:
+            raise _SpeedtestStuckError(
+                f"poll timed out after {SPEEDTEST_POLL_TIMEOUT}s on "
+                f"{SPEEDTEST_MAX_ATTEMPTS} consecutive attempt(s)"
+            )
 
         # Fetch results — vManage may take a few seconds to index the result, so
         # retry with increasing delays before giving up.
@@ -1385,7 +1414,6 @@ def _run_speedtest(ip: str, src_color: str) -> None:
         ul = result.get("up_speed", 0)
         label = f"↓{dl:.1f} ↑{ul:.1f} Mbps"
         log(ip, f"Speedtest: {label}  circuit={result.get('source_circuit')}→{result.get('destination_circuit')}", console=True)
-        hostname = hostnames.get(ip, ip)
         site_key = re.sub(r'-R\d+$', '', hostname)  # e.g. SC-3-0079
         webex_notify(f"📊 **{hostname}** (`{ip}`): speedtest {label}")
         with state_lock:
@@ -1425,9 +1453,21 @@ def _run_speedtest(ip: str, src_color: str) -> None:
 
         _try_trigger_policy_for_site(ip)
 
+    except _SpeedtestStuckError as exc:
+        log(ip, f"⚠️  Speedtest STUCK [{hostname}] ({ip}): {exc}", console=True)
+        log(ip, f"⚠️  Likely CSCwb48953 — stuck session on router requires manual reboot to clear", console=True)
+        webex_notify(
+            f"⚠️ **STUCK** {hostname} (`{ip}`): speedtest hung after {SPEEDTEST_MAX_ATTEMPTS} attempts "
+            f"— likely **CSCwb48953**; **manual router reboot** may be required to clear stuck session"
+        )
+        with state_lock:
+            speedtest_status[ip] = "STUCK"
+        save_status()
+        return  # pipeline continues for other devices; this device needs manual follow-up
+
     except Exception as exc:
-        log(ip, f"Speedtest FAILED: {exc}", console=True)
-        webex_notify(f"⚠️ **FAILURE** {hostnames.get(ip, ip)} (`{ip}`): speedtest failed — {exc}")
+        log(ip, f"Speedtest FAILED [{hostname}] ({ip}): {exc}", console=True)
+        webex_notify(f"⚠️ **FAILURE** {hostname} (`{ip}`): speedtest failed — {exc}")
         with state_lock:
             speedtest_status[ip] = "FAILED"
 
@@ -1711,6 +1751,12 @@ def move_to_final_config_group(ip: str) -> None:
             log(ip, f"vManage: config deploy task {action_id} — polling for completion", console=True)
             deadline = time.time() + 1800
             while time.time() < deadline:
+                # _collect_one may have already confirmed the config landed via SSH
+                # and marked us DEPLOYED — no need to keep polling.
+                with state_lock:
+                    if vmanage_status.get(ip) == "DEPLOYED":
+                        log(ip, "vManage: config task poll — _collect_one confirmed DEPLOYED via SSH, stopping poll", console=True)
+                        break
                 time.sleep(15)
                 try:
                     r = vmanage_session.get(
