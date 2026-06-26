@@ -973,6 +973,7 @@ def deploy_policy_group_for_site(site_ips: list[str]) -> None:
         if action_id:
             log(log_ip, f"vManage: policy deploy task {action_id} — polling for completion", console=True)
             deadline = time.time() + 1800
+            _consecutive_empty = 0
             while time.time() < deadline:
                 time.sleep(15)
                 try:
@@ -994,17 +995,57 @@ def deploy_policy_group_for_site(site_ips: list[str]) -> None:
                         break
                     elif summary_status.lower() in ("error", "failed"):
                         raise ValueError(f"policy deploy task failed with status: {summary_status!r}")
+                    elif summary_status == "":
+                        # vManage 20.15 consistently returns empty summary even after task
+                        # completes — check SSH side after 4 consecutive blanks (~1 min)
+                        _consecutive_empty += 1
+                        if _consecutive_empty >= 4:
+                            with state_lock:
+                                ssh_all_complete = all(
+                                    device_info.get(sip, {}).get('policy') == 'COMPLETE'
+                                    for sip in site_ips
+                                )
+                            if ssh_all_complete:
+                                log(log_ip,
+                                    f"Policy task {action_id} status blank but SSH confirms "
+                                    "POLICY: COMPLETE on all site devices — treating as deployed",
+                                    console=True)
+                                break
+                    else:
+                        _consecutive_empty = 0
                 except ValueError:
                     raise
                 except Exception as exc:
                     log(log_ip, f"vManage: policy task poll error: {exc}")
             else:
-                raise ValueError("policy deploy task did not complete within 30 minutes")
+                # vManage task status stuck at '' for 30 min — check SSH side before failing
+                with state_lock:
+                    ssh_all_complete = all(
+                        device_info.get(sip, {}).get('policy') == 'COMPLETE'
+                        for sip in site_ips
+                    )
+                if ssh_all_complete:
+                    log(log_ip,
+                        "Policy task status never resolved but SSH confirms POLICY: COMPLETE on all "
+                        "site devices — treating as deployed", console=True)
+                else:
+                    raise ValueError("policy deploy task did not complete within 30 minutes")
         else:
             log(log_ip, "vManage: policy deploy had no action ID — waiting for vManage tasks to clear", console=True)
             set_all("DEPLOYING")
             if not _wait_for_vmanage_idle(log_ip, timeout=1800):
-                raise ValueError("policy deploy task did not complete within 30 minutes")
+                # Same SSH fallback for the idle-wait path
+                with state_lock:
+                    ssh_all_complete = all(
+                        device_info.get(sip, {}).get('policy') == 'COMPLETE'
+                        for sip in site_ips
+                    )
+                if ssh_all_complete:
+                    log(log_ip,
+                        "Policy idle-wait timed out but SSH confirms POLICY: COMPLETE on all "
+                        "site devices — treating as deployed", console=True)
+                else:
+                    raise ValueError("policy deploy task did not complete within 30 minutes")
 
         set_all("DEPLOYED")
         log(log_ip, f"vManage: policy group DEPLOYED for site {site_key}", console=True)
@@ -2103,38 +2144,95 @@ def upgrade_device(ip: str) -> None:
                         file_copying.discard(ip)
 
                 # ── Step 4: Install ───────────────────────────────────────────
+                # Use an interactive shell (PTY) for the install command.
+                # On IOS-XE SD-WAN, exec_command (no PTY) causes the device to
+                # close the channel immediately for this command; a PTY-backed
+                # shell keeps the session open for the ~5-minute install duration.
                 set_step("INSTALLING")
                 install_cmd = (
                     f"request platform software sdwan software install {INSTALL_FILE}"
                 )
+                install_output = ""
                 try:
-                    client, install_output = run_command(
-                        client, ip, install_cmd,
-                        timeout=INSTALL_TIMEOUT, no_retry=True,
-                    )
-                    log(ip, f"Install output:\n{install_output.strip()}")
-                    if "error" in install_output.lower() or "failed" in install_output.lower():
-                        client.close()
-                        fail("Install command reported an error")
-                        return
-                except (EOFError, socket.timeout, TimeoutError) as exc:
-                    log(ip, f"Install SSH timeout ({type(exc).__name__}) — reconnecting to check operation status", console=True)
+                    # Always use a fresh SSH connection for invoke_shell — a connection
+                    # that works for exec_command can still have invoke_shell fail if the
+                    # channel is in a degraded state (EOFError on shell open).
                     try:
                         client.close()
                     except Exception:
                         pass
                     client = ssh_connect(ip)
+                    shell = client.invoke_shell(width=200, height=50)
+                    shell.settimeout(5)
+                    # Drain the initial prompt/banner
+                    time.sleep(1)
+                    try:
+                        while shell.recv_ready():
+                            shell.recv(4096)
+                    except Exception:
+                        pass
+                    log(ip, f"CMD (shell): {install_cmd}")
+                    shell.send(install_cmd + "\n")
+                    # Read install output until SUCCESS/FAILED or deadline
+                    deadline = time.time() + INSTALL_TIMEOUT
+                    last_data = time.time()
+                    while time.time() < deadline:
+                        try:
+                            chunk = shell.recv(4096).decode(errors="replace")
+                            if chunk:
+                                install_output += chunk
+                                last_data = time.time()
+                                for line in chunk.splitlines():
+                                    if line.strip():
+                                        log(ip, f"Install: {line.rstrip()}")
+                                if "SUCCESS: install_add" in install_output:
+                                    break
+                                if "FAILED: install_add" in install_output:
+                                    break
+                        except socket.timeout:
+                            if time.time() - last_data > 300:
+                                log(ip, "Install: no output for 5 minutes — giving up", console=True)
+                                break
+                    try:
+                        shell.close()
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    log(ip, f"Install shell error: {type(exc).__name__}: {exc}", console=True)
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                    client = ssh_connect(ip)
+
+                log(ip, f"Install output summary:\n{install_output.strip()[-500:]}")
+                if "SUCCESS: install_add" in install_output:
+                    log(ip, "Install completed successfully", console=True)
+                elif "FAILED: install_add" in install_output:
+                    fail("Install command reported failure")
+                    return
+                else:
+                    # Output ambiguous or session dropped mid-install — verify via op status
+                    log(ip, "Install output inconclusive — verifying via operation status", console=True)
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                    client = ssh_connect(ip)
+                    time.sleep(15)
                     poll_deadline = time.time() + INSTALL_TIMEOUT
+                    _unknown_count = 0
                     while True:
                         client, op_status = _query_install_op_status(client, ip)
                         if op_status == "success":
-                            log(ip, "Install completed successfully (confirmed after SSH timeout)", console=True)
+                            log(ip, "Install completed successfully (confirmed after ambiguous output)", console=True)
                             break
                         if op_status == "failed":
                             client.close()
                             fail("Install failed (confirmed by operation history)")
                             return
                         if op_status == "running":
+                            _unknown_count = 0
                             if time.time() >= poll_deadline:
                                 client.close()
                                 fail("Install timed out waiting for operation to complete")
@@ -2142,10 +2240,14 @@ def upgrade_device(ip: str) -> None:
                             log(ip, "Install still in progress — waiting 60s before recheck", console=True)
                             time.sleep(60)
                             continue
-                        # "unknown" — cannot determine outcome
-                        client.close()
-                        fail("Install operation status unknown after SSH timeout")
-                        return
+                        _unknown_count += 1
+                        if _unknown_count >= 5:
+                            client.close()
+                            fail("Install operation status unknown — no operation found after 5 rechecks")
+                            return
+                        log(ip, f"Install status unknown (attempt {_unknown_count}/5) — "
+                            "waiting 30s before recheck", console=True)
+                        time.sleep(30)
 
             # ── Step 5: Activate (triggers reboot) ────────────────────────────
             _wait_for_site_peers_before_reboot(ip)
@@ -2274,7 +2376,7 @@ def ping_loop(ips: list[str], display_order: list[str]) -> None:
                         if not was_up:
                             up_since[ip] = now
                         elif now - up_since.get(ip, now) >= UP_THRESHOLD:
-                            if ip not in checking and ip not in in_progress and ip not in completed:
+                            if ip not in checking and ip not in in_progress and ip not in completed and ip not in retry_queue:
                                 checking.add(ip)
                                 checking_since[ip] = now
                                 t = threading.Thread(
@@ -2318,25 +2420,41 @@ def _collect_one(ip: str) -> None:
         ssh_config   = device_info.get(ip, {}).get('config', '?')
         vm_status    = vmanage_status.get(ip)
         upgrade_done = completed.get(ip) in PIPELINE_READY
+        spd_done     = str(speedtest_status.get(ip, "")).startswith("↓")
+        pol_done     = policy_status.get(ip) == "DEPLOYED"
+
+    # If speedtest or policy is already done, the device is provably past config deploy.
+    # A REQUIRED reading at this point is a transient SSH check anomaly — ignore it.
+    _pipeline_complete = spd_done or pol_done
 
     # Script says DEPLOYED but device is still on onboard config — re-queue the deploy
     if vm_status == "DEPLOYED" and ssh_config == "REQUIRED" and upgrade_done:
-        log(ip, "Config mismatch: script says DEPLOYED but device still on onboard config — re-queuing config deploy", console=True)
-        with state_lock:
-            vmanage_status[ip]   = None
-            speedtest_status[ip] = None
-        save_status()
-        threading.Thread(target=move_to_final_config_group, args=(ip,), daemon=True).start()
-        return
+        if _pipeline_complete:
+            log(ip, "Config mismatch: script says DEPLOYED but SSH shows REQUIRED — ignoring "
+                "because speedtest/policy already done (transient SSH check)", console=True)
+        else:
+            log(ip, "Config mismatch: script says DEPLOYED but device still on onboard config — re-queuing config deploy", console=True)
+            with state_lock:
+                vmanage_status[ip]   = None
+                speedtest_status[ip] = None
+            save_status()
+            threading.Thread(target=move_to_final_config_group, args=(ip,), daemon=True).start()
+            return
 
     # Config deploy never ran or FAILED — device still on onboard config, kick it off
     if vm_status in ("FAILED", None) and ssh_config == "REQUIRED" and upgrade_done:
-        log(ip, "Config deploy FAILED and device still on onboard config — re-queuing config deploy", console=True)
-        with state_lock:
-            vmanage_status[ip] = None
-        save_status()
-        threading.Thread(target=move_to_final_config_group, args=(ip,), daemon=True).start()
-        return
+        if _pipeline_complete:
+            log(ip, "Config deploy marked FAILED but speedtest/policy already done — recovering pipeline", console=True)
+            with state_lock:
+                vmanage_status[ip] = "DEPLOYED"
+            save_status()
+        else:
+            log(ip, "Config deploy FAILED and device still on onboard config — re-queuing config deploy", console=True)
+            with state_lock:
+                vmanage_status[ip] = None
+            save_status()
+            threading.Thread(target=move_to_final_config_group, args=(ip,), daemon=True).start()
+            return
 
     # Deploy in-progress but SSH already confirms final config landed — no need to wait for verify loop
     if vm_status == "DEPLOYING" and ssh_config == "COMPLETE" and upgrade_done:
