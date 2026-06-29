@@ -1999,6 +1999,7 @@ def _wait_for_site_peers_before_reboot(ip: str) -> None:
                 if i != ip
                 and re.sub(r'-R\d+$', '', hn) == site_key
                 and i in in_progress
+                and in_progress_step.get(i) == "INSTALLING"  # only block on active bandwidth use
             }
         if not blocking:
             return
@@ -2092,6 +2093,7 @@ def upgrade_device(ip: str) -> None:
             log(ip, f"{TARGET_VERSION} is installed but not active — resuming at activate", console=True)
 
             # ── Step 5: Activate (triggers reboot) ────────────────────────────
+            set_step("WAIT ACTIVATE")
             _wait_for_site_peers_before_reboot(ip)
             set_step("ACTIVATING")
             activate_cmd = (
@@ -2296,6 +2298,7 @@ def upgrade_device(ip: str) -> None:
                         time.sleep(30)
 
             # ── Step 5: Activate (triggers reboot) ────────────────────────────
+            set_step("WAIT ACTIVATE")
             _wait_for_site_peers_before_reboot(ip)
             set_step("ACTIVATING")
             activate_cmd = (
