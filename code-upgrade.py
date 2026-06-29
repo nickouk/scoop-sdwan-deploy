@@ -141,6 +141,11 @@ vmanage_tasks:        list[dict]      = []   # active tasks polled from vManage 
 vmanage_tasks_lock    = threading.Lock()
 state_lock    = threading.Lock()
 print_lock    = threading.Lock()
+# Push-gate: config deploys run concurrently across sites, but policy waits for all
+# config deploys to finish (and vice-versa) to prevent CONFD conflicts.
+_push_cond              = threading.Condition(threading.Lock())
+_config_deploys_active  = 0     # incremented per device, decremented on completion
+_policy_deploy_active   = False # True while any policy group deploy is in flight
 _info_sem     = threading.Semaphore(10)  # max concurrent info-collection SSH sessions
 _log_file     = None   # opened in main()
 
@@ -562,17 +567,37 @@ def collect_device_info(client: paramiko.SSHClient, ip: str) -> paramiko.SSHClie
     except Exception as exc:
         log(ip, f"CONFIG collect error: {type(exc).__name__}: {exc}")
 
-    # ── POLICY: show utd engine standard config ───────────────────────────────
+    # ── POLICY: show utd engine standard config + status ─────────────────────
+    # Config check confirms the policy was pushed; status check confirms the UTD
+    # engine is actually running (config present but engine not started = failed push).
     try:
-        client, out = run_command(client, ip, "show utd engine standard config", timeout=SSH_TIMEOUT)
-        log(ip, f"show utd engine standard config output:\n{out.strip()}")
-        policy_status = '?'  # stays '?' if Unified Policy line not found
-        for line in out.splitlines():
+        client, cfg_out = run_command(client, ip, "show utd engine standard config", timeout=SSH_TIMEOUT)
+        log(ip, f"show utd engine standard config output:\n{cfg_out.strip()}")
+        unified_policy_enabled = False
+        for line in cfg_out.splitlines():
             if 'unified policy' in line.lower():
                 parts = [p.strip() for p in re.split(r':\s*|\s{2,}', line.strip()) if p.strip()]
                 value = parts[-1] if len(parts) >= 2 else ''
-                policy_status = 'COMPLETE' if value.lower() == 'enabled' else 'REQUIRED'
+                unified_policy_enabled = value.lower() == 'enabled'
                 break
+
+        if unified_policy_enabled:
+            # Also verify the engine is actually running — config present but engine
+            # not started indicates a failed policy push (e.g. CONFD error on vManage).
+            client, sts_out = run_command(client, ip, "show utd engine standard status", timeout=SSH_TIMEOUT)
+            log(ip, f"show utd engine standard status output:\n{sts_out.strip()}")
+            engine_green = any(
+                'overall system status' in line.lower() and 'green' in line.lower()
+                for line in sts_out.splitlines()
+            )
+            if engine_green:
+                policy_status = 'COMPLETE'
+            else:
+                policy_status = 'REQUIRED'
+                log(ip, "POLICY: UTD config present but engine not green — treating as REQUIRED", console=True)
+        else:
+            policy_status = 'REQUIRED' if cfg_out.strip() else '?'
+
         info['policy'] = policy_status
         log(ip, f"POLICY: {policy_status}")
     except Exception as exc:
@@ -880,8 +905,22 @@ def deploy_policy_group_for_site(site_ips: list[str]) -> None:
         save_status()
         return
 
+    # Wait for all in-flight config deploys to finish before starting the policy deploy.
+    with _push_cond:
+        while _config_deploys_active > 0 or _policy_deploy_active:
+            if _config_deploys_active > 0:
+                log(log_ip, f"vManage: push-gate — waiting for {_config_deploys_active} config deploy(s) to finish before policy deploy", console=True)
+            else:
+                log(log_ip, "vManage: push-gate — waiting for another policy deploy to finish", console=True)
+            _push_cond.wait(timeout=30)
+        global _policy_deploy_active
+        _policy_deploy_active = True
+
     if not _wait_for_vmanage_idle(log_ip):
         log(log_ip, "vManage: timed out waiting for tasks to clear before policy deploy", console=True)
+        with _push_cond:
+            _policy_deploy_active = False
+            _push_cond.notify_all()
         set_all("FAILED")
         save_status()
         return
@@ -1068,6 +1107,10 @@ def deploy_policy_group_for_site(site_ips: list[str]) -> None:
         with state_lock:
             for ip in site_ips:
                 _policy_retry_after[ip] = time.time() + 300
+    finally:
+        with _push_cond:
+            _policy_deploy_active = False
+            _push_cond.notify_all()
 
     save_status()
 
@@ -1630,8 +1673,19 @@ def move_to_final_config_group(ip: str) -> None:
         save_status()
         return
 
+    # Wait for any in-flight policy deploy to finish before starting a config deploy.
+    with _push_cond:
+        while _policy_deploy_active:
+            log(ip, "vManage: push-gate — waiting for policy deploy to finish before config deploy", console=True)
+            _push_cond.wait(timeout=30)
+        global _config_deploys_active
+        _config_deploys_active += 1
+
     if not _wait_for_vmanage_idle(ip):
         log(ip, "vManage: timed out waiting for running tasks to clear — skipping move", console=True)
+        with _push_cond:
+            _config_deploys_active -= 1
+            _push_cond.notify_all()
         with state_lock:
             vmanage_status[ip] = "FAILED"
         save_status()
@@ -1842,6 +1896,10 @@ def move_to_final_config_group(ip: str) -> None:
             vmanage_status[ip] = "FAILED"
         if disassociated:
             _vmanage_rollback_to_onboard(ip, uuid)
+    finally:
+        with _push_cond:
+            _config_deploys_active -= 1
+            _push_cond.notify_all()
 
     save_status()
 
