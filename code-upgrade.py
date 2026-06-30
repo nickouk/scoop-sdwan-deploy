@@ -891,6 +891,7 @@ def deploy_policy_group_for_site(site_ips: list[str]) -> None:
     Associate and deploy the policy group for all devices at a site in a single
     vManage task, avoiding transaction conflicts from concurrent per-device tasks.
     """
+    global _policy_deploy_active
     log_ip   = site_ips[0]
     site_key = re.sub(r'-R\d+$', '', hostnames.get(log_ip, log_ip))
 
@@ -913,7 +914,6 @@ def deploy_policy_group_for_site(site_ips: list[str]) -> None:
             else:
                 log(log_ip, "vManage: push-gate — waiting for another policy deploy to finish", console=True)
             _push_cond.wait(timeout=30)
-        global _policy_deploy_active
         _policy_deploy_active = True
 
     if not _wait_for_vmanage_idle(log_ip):
@@ -1611,6 +1611,7 @@ def _vmanage_build_variable_list(ip: str, target_group: str, uuid: str, csv_row:
 
 def move_to_final_config_group(ip: str) -> None:
     """Move device from onboarding to final config group. Runs in its own thread."""
+    global _config_deploys_active
     with state_lock:
         upgrade_done   = completed.get(ip) in PIPELINE_READY
         config_status  = device_info.get(ip, {}).get('config', '?')
@@ -1678,7 +1679,6 @@ def move_to_final_config_group(ip: str) -> None:
         while _policy_deploy_active:
             log(ip, "vManage: push-gate — waiting for policy deploy to finish before config deploy", console=True)
             _push_cond.wait(timeout=30)
-        global _config_deploys_active
         _config_deploys_active += 1
 
     if not _wait_for_vmanage_idle(ip):
