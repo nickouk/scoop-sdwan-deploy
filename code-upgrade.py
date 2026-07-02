@@ -1674,6 +1674,41 @@ def move_to_final_config_group(ip: str) -> None:
         save_status()
         return
 
+    # ── Pre-flight: check if device is already on the correct final config group ──
+    # Avoids a needless disassociate/associate/deploy cycle on script restarts or
+    # when the device was manually moved to the final group before the script ran.
+    try:
+        m = re.match(r'^SC-(\d+)-(\d{4})-', hostname) if hostname else None
+        if m:
+            _check_site_type  = m.group(1)
+            _check_target_grp = VMANAGE_FINAL_GROUPS.get(_check_site_type)
+            _check_uuid       = _vmanage_get_device_uuid(ip)
+            if _check_target_grp and _check_uuid:
+                r = vmanage_session.get(
+                    f"{VMANAGE_BASE_URL}/dataservice/v1/config-group/{_check_target_grp}/device/associate",
+                    timeout=15,
+                )
+                if r.ok:
+                    raw = r.json()
+                    entries = raw if isinstance(raw, list) else raw.get("data", raw.get("devices", []))
+                    associated_uuids = {
+                        (e.get("id") or e.get("deviceId") or e.get("uuid") or "").strip().upper()
+                        for e in entries
+                    }
+                    if _check_uuid.upper() in associated_uuids:
+                        log(ip, "vManage: device already on final config group — marking DEPLOYED and resuming pipeline", console=True)
+                        with state_lock:
+                            vmanage_status[ip] = "DEPLOYED"
+                            existing_spd = speedtest_status.get(ip, "")
+                        save_status()
+                        webex_notify(f"✅ **{hostnames.get(ip, ip)}** (`{ip}`): config group DEPLOYED")
+                        if not str(existing_spd).startswith("↓"):
+                            threading.Thread(target=run_speedtest, args=(ip,), daemon=True).start()
+                        _try_trigger_policy_for_site(ip)
+                        return
+    except Exception as exc:
+        log(ip, f"vManage: pre-flight group check failed ({exc}) — proceeding with full deploy")
+
     # Wait for any in-flight policy deploy to finish before starting a config deploy.
     with _push_cond:
         while _policy_deploy_active:
